@@ -1,6 +1,6 @@
 [project]
 name = "ltx-trainer"
-version = "1.4.1"
+version = "1.4.2"
 description = "LTX-2 training, democratized."
 readme = "README.md"
 authors = [

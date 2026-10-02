@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-kernels"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
     "torch",
     "triton>=3.0",

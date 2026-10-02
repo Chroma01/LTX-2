@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2 - 2026-10-01
+
+### Added
+
+- `ltx_pipelines.alpha_gen`, a one-stage IC-LoRA pipeline on the full model with video CFG 1 and STG off.
+
 ## 1.4.1 - 2026-09-30
 
 ### Changed

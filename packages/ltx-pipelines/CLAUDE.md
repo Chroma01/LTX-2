@@ -38,6 +38,7 @@ CLI: on `python -m ltx_pipelines.distilled`, `python -m ltx_pipelines.ti2vid_two
 | `DubItPipeline` | `dubit.py` | 2 | Distilled only | Euler | Dub-It with IC-LoRA + audio ref conditioning |
 | `RetakePipeline` | `retake.py` | 1 | Full or distilled | Euler | Video region regeneration |
 | `HDRICLoraPipeline` | `hdr_ic_lora.py` | 1 | Distilled + HDR IC-LoRA | Euler | ACEScct SDR-to-HDR; DFR seam keyframes on by default |
+| `AlphaGenPipeline` | `alpha_gen.py` | 1 | Full + IC-LoRA | Euler | Guided one-stage IC-LoRA (video CFG 1, STG off) |
 
 ## Guidance
 
