@@ -26,48 +26,46 @@ from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     patchify_audio_reference_latent,
 )
-from ltx_pipelines.utils.helpers import combined_image_conditionings
+from ltx_pipelines.utils.helpers import image_conditionings
 from ltx_pipelines.utils.media_io import is_exr_dir
 from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
-from ltx_pipelines.utils.types import ImageConditioningInput
+from ltx_pipelines.utils.types import LoadedImageConditioning
 
 
-def assert_image_frames_in_clip(images: Sequence[ImageConditioningInput], num_frames: int) -> None:
-    """Raise if any image ``frame_idx`` lies outside the planned stitched clip."""
+def assert_image_frames_in_clip(images: Sequence[LoadedImageConditioning], num_frames: int) -> None:
+    """Raise if any image binding index lies outside the planned stitched clip."""
     for image in images:
-        if image.frame_idx < 0 or image.frame_idx >= num_frames:
-            raise ValueError(f"frame_idx={image.frame_idx} is outside the planned stitched range [0, {num_frames})")
+        image.assert_in_clip(num_frames)
 
 
-def images_for_chunk(chunk: Chunk, images: Sequence[ImageConditioningInput]) -> list[ImageConditioningInput]:
+def images_for_chunk(chunk: Chunk, images: Sequence[LoadedImageConditioning]) -> list[LoadedImageConditioning]:
     """Remap clip-level image inputs onto ``chunk``'s stitched kept window."""
-    return [
-        image._replace(frame_idx=local)
-        for image in images
-        if (local := chunk.layout.local_frame_index(image.frame_idx)) is not None
-    ]
+    local_images: list[LoadedImageConditioning] = []
+    for image in images:
+        local_image = image.map_frame_index(chunk.layout.local_frame_index)
+        if local_image is not None:
+            local_images.append(local_image)
+    return local_images
 
 
 def image_conditionings_for_chunk(
     chunk: Chunk,
     *,
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     video_encoder: VideoEncoder,
-    color_space: EXRColorSpace | None = None,
 ) -> list[ConditioningItem]:
     """Encode image conditionings that land in ``chunk``, at its current latent spatial size."""
     local = images_for_chunk(chunk, images)
     if not local or chunk.video is None:
         return []
     height, width = _pixel_hw(chunk)
-    return combined_image_conditionings(
-        images=local,
+    return image_conditionings(
+        images=list(local),
         height=height,
         width=width,
         video_encoder=video_encoder,
         dtype=chunk.video.dtype,
         device=chunk.video.device,
-        color_space=color_space,
     )
 
 
@@ -155,10 +153,7 @@ def audio_reference_conditionings_for_chunk(
     strength: float = 1.0,
     negative_positions: bool = True,
 ) -> list[ConditioningItem]:
-    """Build audio-reference tokens for ``chunk``, sliced to its layout window.
-    ``latent`` is the full-clip VAE latent. ``latent is None`` means use the chunk's own
-    audio latent (stage-2 self-reference).
-    """
+    """Build audio-reference tokens for ``chunk``, sliced to its layout window."""
     source = chunk.audio if latent is None else audio_latent_for_layout(latent, chunk.layout, fps)
     if source is None:
         raise ValueError("audio reference with latent=None requires chunk.audio")

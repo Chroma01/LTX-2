@@ -5,6 +5,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include "cuda/rms_norm_split_rope.cuh"
+
 // CUDA kernel template for RMS norm + split RoPE
 // out_t can be at::Float8_e4m3fn or at::BFloat16
 
@@ -20,14 +22,6 @@ using fp8 = __nv_fp8_e4m3;
 // kPairsPerThread must divide d/2, so a thread never straddles two heads, and
 // kPairsPerThread * threads_per_row * 2 must equal h.
 constexpr int kPairsPerThread = 16;
-
-template<int N>
-__device__ __forceinline__ void _load_run(const bf16* source, bf16 values[N]) {
-    #pragma unroll
-    for (int i = 0; i < N / 8; i++) {
-        reinterpret_cast<int4*>(values)[i] = reinterpret_cast<const int4*>(source)[i];
-    }
-}
 
 // Frequency tables are laid out logically as [b, n, s, d/2] (what
 // apply_split_rotary_emb produces -- a swapaxes view whose physical layout is
@@ -70,40 +64,14 @@ __global__ void _rms_norm_split_rope_kernel(
         + static_cast<long>(head) * sin_sn
         + static_cast<long>(safe_token % s) * sin_ss + freq0;
 
-    bf16 first_raw[PAIRS], second_raw[PAIRS];
-    bf16 cos_raw[PAIRS], sin_raw[PAIRS];
     bf16 first_weight[PAIRS], second_weight[PAIRS];
-    _load_run<PAIRS>(x + row + first_channel, first_raw);
-    _load_run<PAIRS>(x + row + second_channel, second_raw);
-    _load_run<PAIRS>(cos_freqs + freq_offset, cos_raw);
-    _load_run<PAIRS>(sin_freqs + sin_offset, sin_raw);
-    _load_run<PAIRS>(weights + first_channel, first_weight);
-    _load_run<PAIRS>(weights + second_channel, second_weight);
-
-    float first[PAIRS], second[PAIRS], sum_sq = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < PAIRS; i++) {
-        first[i] = float(first_raw[i]);
-        second[i] = float(second_raw[i]);
-        sum_sq += first[i] * first[i] + second[i] * second[i];
-    }
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-    }
-
-    // One barrier: every thread re-sums the per-warp partials itself. Electing one
-    // thread to sum them and publish the result back needs a second barrier.
-    if ((lane_in_row & 31) == 0) {
-        smem[row_in_block * kWarpsPerRow + lane_in_row / 32] = sum_sq;
-    }
-    __syncthreads();
-    float total_sum = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < kWarpsPerRow; i++) {
-        total_sum += smem[row_in_block * kWarpsPerRow + i];
-    }
-    const float inv_rms = rsqrtf(total_sum / h + eps);
+    ltx_kernels::load_run<PAIRS>(weights + first_channel, first_weight);
+    ltx_kernels::load_run<PAIRS>(weights + second_channel, second_weight);
+    float first_rot[PAIRS], second_rot[PAIRS];
+    ltx_kernels::rms_norm_split_rope_pairs<PAIRS, kWarpsPerRow>(
+        x + row + first_channel, x + row + second_channel, cos_freqs + freq_offset, sin_freqs + sin_offset,
+        first_weight, second_weight, eps, h, lane_in_row, smem + row_in_block * kWarpsPerRow, first_rot,
+        second_rot);
 
     // at::Float8_e4m3fn / at::BFloat16 do not convert from the native CUDA types, so
     // the staging arrays and the output pointer both use the native one.
@@ -111,16 +79,12 @@ __global__ void _rms_norm_split_rope_kernel(
     store_t first_out[PAIRS], second_out[PAIRS];
     #pragma unroll
     for (int i = 0; i < PAIRS; i++) {
-        const float a = first[i] * inv_rms * float(first_weight[i]);
-        const float c = second[i] * inv_rms * float(second_weight[i]);
-        const float cs = float(cos_raw[i]);
-        const float sn = float(sin_raw[i]);
         if constexpr (std::is_same_v<out_t, at::Float8_e4m3fn>) {
-            first_out[i] = fp8(a * cs - c * sn);
-            second_out[i] = fp8(c * cs + a * sn);
+            first_out[i] = fp8(first_rot[i]);
+            second_out[i] = fp8(second_rot[i]);
         } else {
-            first_out[i] = __float2bfloat16(a * cs - c * sn);
-            second_out[i] = __float2bfloat16(c * cs + a * sn);
+            first_out[i] = __float2bfloat16(first_rot[i]);
+            second_out[i] = __float2bfloat16(second_rot[i]);
         }
     }
     if (active) {

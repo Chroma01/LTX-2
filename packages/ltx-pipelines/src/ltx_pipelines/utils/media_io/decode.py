@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Generator, Iterator
+from concurrent.futures import Future
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import av
 import numpy as np
@@ -15,10 +18,11 @@ from PIL import ExifTags, Image, ImageCms, UnidentifiedImageError
 from torch._prims_common import DeviceLikeType
 
 from ltx_core.types import Audio, VideoPixelShape
-from ltx_pipelines.utils.media_io.color_config import EXRColorSpace, srgb_to_acescct
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace, srgb_to_acescct, to_working_space
 from ltx_pipelines.utils.media_io.exr import (
+    _exr_paths_for_conditioning,
     is_exr_dir,
-    load_exr_image_as_hdr_conditioning,
+    read_exr,
 )
 from ltx_pipelines.utils.media_io.range_map import normalize_images, to_vae_range
 from ltx_pipelines.utils.media_io.resize import (
@@ -26,6 +30,9 @@ from ltx_pipelines.utils.media_io.resize import (
     resize_and_center_crop,
     resize_and_reflect_pad,
 )
+
+if TYPE_CHECKING:
+    from ltx_pipelines.utils.types import DecodedStill
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,9 @@ _INT_FORMAT_MAX: dict[str, float] = {
 }
 
 
+_EXR_NEEDS_COLOR_SPACE = "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
+
+
 def load_image_and_preprocess(
     image_path: str,
     height: int,
@@ -60,25 +70,70 @@ def load_image_and_preprocess(
     An ``.exr`` still requires ``color_space`` (from ``--hdr``) and is loaded via the
     HDR conditioning path instead of the SDR decode/normalize path.
     """
+    return load_conditioning_still(image_path, crf, color_space).tensor(height, width, dtype, device)
+
+
+def load_conditioning_still(image_path: str, crf: int, color_space: EXRColorSpace | None = None) -> DecodedStill:
+    """Decode an image conditioning's still once, for every resolution a run encodes it at.
+    An SDR image is decoded and re-compressed at ``crf``; an ``.exr`` still is read as linear HDR and
+    needs ``color_space`` (from ``--hdr``). A missing or undecodable file of either kind raises
+    ``ValueError("Cannot decode image file '<path>'.")``.
+    """
     if str(image_path).lower().endswith(".exr"):
         if color_space is None:
-            raise ValueError(
-                "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
-            )
-        return load_exr_image_as_hdr_conditioning(
-            exr_path=image_path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            color_space=color_space,
-        )
-    image = decode_image(image_path=image_path)
-    image = preprocess(image=image, crf=crf)
-    image = torch.tensor(image, dtype=torch.float32, device=device)
-    image = resize_and_center_crop(image, height, width)
-    image = normalize_images(image, device, dtype)
-    return image
+            raise ValueError(_EXR_NEEDS_COLOR_SPACE)
+        try:
+            pixels = read_exr(_exr_paths_for_conditioning(image_path)[0])
+        except (OSError, RuntimeError, ValueError) as err:
+            raise ValueError(f"Cannot decode image file '{image_path}'.") from err
+        return ExrStill(pixels, color_space)
+    image = preprocess(image=decode_image(image_path=image_path), crf=crf)
+    image.setflags(write=False)
+    return SdrStill(image)
+
+
+def check_conditioning_still(image_path: str, color_space: EXRColorSpace | None = None) -> None:
+    """Raise what :func:`load_conditioning_still` would for a missing file or an EXR without ``color_space``.
+    Cheap enough for a pipeline's prologue when the decode itself runs elsewhere.
+    """
+    if str(image_path).lower().endswith(".exr") and color_space is None:
+        raise ValueError(_EXR_NEEDS_COLOR_SPACE)
+    if not Path(image_path).exists():
+        raise ValueError(f"Cannot decode image file '{image_path}'.")
+
+
+@dataclass(frozen=True, eq=False)
+class BackgroundStill:
+    """A still decoding on a worker thread; :meth:`tensor` waits for it and re-raises its decode error."""
+
+    future: Future[DecodedStill]
+
+    def tensor(self, height: int, width: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        return self.future.result().tensor(height, width, dtype, device)
+
+
+@dataclass(frozen=True, eq=False)
+class SdrStill:
+    """A decoded SDR still, re-compressed at its conditioning CRF: read-only ``(H, W, 3)`` uint8."""
+
+    pixels: np.ndarray
+
+    def tensor(self, height: int, width: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        image = torch.tensor(self.pixels, dtype=torch.float32, device=device)
+        image = resize_and_center_crop(image, height, width)
+        return normalize_images(image, device, dtype)
+
+
+@dataclass(frozen=True, eq=False)
+class ExrStill:
+    """A linear HDR still as read from EXR, ``(H, W, 3)`` float, mapped to the VAE working space per resolution."""
+
+    pixels: torch.Tensor
+    color_space: EXRColorSpace
+
+    def tensor(self, height: int, width: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        frame = resize_and_center_crop(self.pixels.to(device=device, dtype=torch.float32), height, width)
+        return to_vae_range(to_working_space(frame, self.color_space)).to(device=device, dtype=dtype)
 
 
 def video_preprocess(
@@ -416,12 +471,12 @@ def preprocess(image: np.array, crf: int) -> np.array:
     ``crf`` is required: the correct value is a property of the model generation, so a
     code-level default here would silently condition on the wrong compression. Reaching this
     with ``crf=None`` means a conditioning skipped resolution -- see
-    ``ImageConditioner.resolve_crf``, which every pipeline runs over its image inputs.
+    ``ImageConditioner.load_conditionings``, which every pipeline runs over its image inputs.
     """
     if crf is None:
         raise ValueError(
             "Image conditioning CRF is unresolved (crf=None). Resolve it against the checkpoint "
-            "first -- ImageConditioner.resolve_crf(images), or detect_params(checkpoint_path).default_image_crf."
+            "first -- ImageConditioner.load_conditionings(images), or detect_params(checkpoint_path).default_image_crf."
         )
     if crf == 0:
         return image

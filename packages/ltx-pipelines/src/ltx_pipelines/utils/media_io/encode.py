@@ -23,6 +23,7 @@ from ltx_core.color.hlg import encode_linear_hdr_frames_to_hlg_mp4
 from ltx_core.color.primaries import Primaries
 from ltx_core.color.yuv import FrameConverter, PixelFormat, yuv420p_bt709_converter_
 from ltx_core.types import Audio
+from ltx_pipelines.marking.types import AudioMarker, VideoMarker
 from ltx_pipelines.utils.media_io.color_config import EXRColorSpace, decode_hdr_video
 from ltx_pipelines.utils.media_io.exr import exr_colorspace_tag, exr_dir_label, save_exr_tensor
 
@@ -130,6 +131,35 @@ def _encode_hdr_video_outputs(
     return exr_dir
 
 
+# Frames converted and handed to the encoder thread at a time: x264 starts on the first slice
+# while the rest are still being converted and copied off the GPU.
+_HOST_SLICE_FRAMES = 8
+
+# The encoder's conversion stream, one per device for the life of the process. cuBLAS keeps a workspace per
+# (handle, stream) until the process exits, so every new stream a GEMM runs on stays charged to the allocator.
+_CONVERT_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _convert_stream(device: torch.device) -> torch.cuda.Stream:
+    stream = _CONVERT_STREAMS.get(device)
+    if stream is None:
+        stream = _CONVERT_STREAMS[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
+def _to_host(frames: torch.Tensor) -> np.ndarray:
+    """Copy converted frames to the host through a pinned buffer.
+    Pinned buffers come from torch's caching host allocator, so repeated encodes reuse them
+    instead of page-faulting a fresh pageable allocation per clip. The array keeps its buffer
+    alive until the encoder thread drops it.
+    """
+    if frames.device.type != "cuda":
+        return frames.to("cpu").numpy()
+    host = torch.empty(frames.shape, dtype=frames.dtype, pin_memory=True)
+    host.copy_(frames)
+    return host.numpy()
+
+
 def _open_video_stream(
     container: av.container.Container,
     fps: int,
@@ -153,7 +183,7 @@ def _open_video_stream(
     return stream
 
 
-def encode_sdr_h264(
+def encode_sdr_h264(  # noqa: PLR0913
     video: Iterator[torch.Tensor],
     *,
     fps: int,
@@ -165,26 +195,41 @@ def encode_sdr_h264(
     crf: int = 19,
     preset: str = "veryfast",
     thread_count: int = 0,
+    chunks_complete: bool = False,
+    video_marker: VideoMarker | None = None,
 ) -> None:
     """Mux RGB frame chunks to SDR H.264 (optional AAC).
     Pass :func:`~ltx_pipelines.chunks.deferred_stitch_audio` (and ``audio_sampling_rate``)
     when audio is assembled while ``video`` is consumed. Pull the iterator only after
-    video drain.
+    video drain. ``chunks_complete`` says each CUDA chunk is finished on every stream when
+    ``video`` yields it (see :func:`encode_video`). ``video_marker`` stamps each slice on the
+    stream that converts it.
     """
 
-    def convert(chunk: torch.Tensor) -> torch.Tensor:
-        return frame_converter(chunk.movedim(-1, -3))
+    def converted(piece: torch.Tensor) -> np.ndarray:
+        if video_marker is not None:
+            piece = video_marker.embed(piece)
+        return _to_host(frame_converter(piece.movedim(-1, -3)))
+
+    def host_frames(piece: torch.Tensor) -> np.ndarray:
+        """Stamp, convert and copy ``piece`` to the host; on the encoder's own stream for complete chunks."""
+        if not (chunks_complete and piece.is_cuda):
+            return converted(piece)
+        with torch.cuda.stream(_convert_stream(piece.device)):
+            return converted(piece)
 
     first_raw_chunk = next(video, None)
     if first_raw_chunk is None:
         raise ValueError("video is empty; expected at least one frame chunk.")
-    first_chunk = convert(first_raw_chunk)
+    # Converted a slice at a time, so the converter's float temporaries stay slice-sized.
+    first_slices = iter(first_raw_chunk.split(_HOST_SLICE_FRAMES))
+    first_slice = host_frames(next(first_slices))
 
     if frame_converter.pixel_format == PixelFormat.RGB24:
-        height, width = first_chunk.shape[-3], first_chunk.shape[-2]
+        height, width = first_slice.shape[-3], first_slice.shape[-2]
     else:
-        height = first_chunk.shape[-2] * 2 // 3
-        width = first_chunk.shape[-1]
+        height = first_slice.shape[-2] * 2 // 3
+        width = first_slice.shape[-1]
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     container = av.open(output_path, mode="w")
@@ -199,16 +244,20 @@ def encode_sdr_h264(
         av_format = frame_converter.pixel_format.av_format
 
         def cpu_chunks() -> Generator[np.ndarray, None, None]:
-            yield first_chunk.to("cpu").numpy()
+            progress = tqdm(total=video_chunks_number)
+            yield first_slice
+            yield from (host_frames(piece) for piece in first_slices)
+            progress.update()
             for chunk in video:
-                yield convert(chunk).to("cpu").numpy()
+                yield from (host_frames(piece) for piece in chunk.split(_HOST_SLICE_FRAMES))
+                progress.update()
+            progress.close()
 
         _encode_chunks_threaded(
             container=container,
             stream=stream,
             av_format=av_format,
             chunks=cpu_chunks(),
-            progress_total=video_chunks_number,
         )
 
         mux_audio = next(audio, None) if audio is not None else None
@@ -237,6 +286,9 @@ def encode_video(  # noqa: PLR0913
     *,
     color_space: EXRColorSpace | None = None,
     audio_sampling_rate: int | None = None,
+    video_marker: VideoMarker | None = None,
+    audio_marker: AudioMarker | None = None,
+    chunks_complete: bool = False,
 ) -> Path | None:
     """Encode RGB frames to video; SDR H.264 or HDR EXR+HLG when ``color_space`` is set.
     Args:
@@ -263,11 +315,21 @@ def encode_video(  # noqa: PLR0913
             When set, writes half EXR frames + HLG master.
         audio_sampling_rate: AAC sample rate. Inferred when ``audio`` is an
             :class:`~ltx_core.types.Audio`; required for an audio iterator.
+        video_marker: Optional pixel marker. ``None`` leaves pixels unchanged.
+            HDR encode must not pass one.
+        audio_marker: Optional audio marker. ``None`` leaves PCM unchanged.
+            Each yielded ``Audio`` is stamped before AAC mux (SDR and HDR).
+        chunks_complete: Each CUDA chunk ``video`` yields is already finished on every stream
+            (e.g. the distributed decoder's batches). SDR conversion and host copies then run
+            on a stream of their own, whose syncs do not wait for whatever else the device is
+            still running -- such as the rest of a streaming decode. Leave ``False`` when a
+            chunk may still be in flight on the current stream.
     Returns:
         EXR output directory when HDR, else ``None``.
     Raises:
         ValueError: On an empty ``video``, a non-stereo ``audio`` waveform, or conflicting
-            explicit and embedded audio sampling rates.
+            explicit and embedded audio sampling rates. Also if ``video_marker`` is set
+            together with ``color_space``.
     """
     if isinstance(audio, Audio):
         validate_audio_waveform(audio)
@@ -281,38 +343,56 @@ def encode_video(  # noqa: PLR0913
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
+    if video_marker is not None and color_space is not None:
+        raise ValueError("video_marker is not supported on HDR encode")
+
+    marked_audio = _mark_audio(audio, audio_marker) if audio_marker is not None and audio is not None else audio
     if color_space is not None:
         return _encode_hdr_video_outputs(
             video,
             Path(output_path),
             fps=float(fps),
             color_space=color_space,
-            audio=audio,
+            audio=marked_audio,
             audio_sampling_rate=audio_sampling_rate,
         )
-
     encode_sdr_h264(
         video,
         fps=fps,
         output_path=output_path,
         video_chunks_number=video_chunks_number,
-        audio=audio,
+        audio=marked_audio,
         audio_sampling_rate=audio_sampling_rate,
         frame_converter=frame_converter,
         crf=crf,
         preset=preset,
         thread_count=thread_count,
+        chunks_complete=chunks_complete,
+        video_marker=video_marker,
     )
     return None
 
 
-def encode_audio(audio: Audio, output_path: str) -> None:
+def _mark_audio(audio: Iterator[Audio], marker: AudioMarker) -> Iterator[Audio]:
+    """Stamp each yielded ``Audio`` independently. Never stitches tracks."""
+    for track in audio:
+        yield marker.embed(track)
+
+
+def encode_audio(
+    audio: Audio,
+    output_path: str,
+    *,
+    audio_marker: AudioMarker | None = None,
+) -> None:
     """Save an audio waveform as a 16-bit PCM ``.wav`` file at the source sampling rate.
     Reuses :func:`_write_audio` (the same muxing path used by :func:`encode_video`);
     the only difference is a PCM (``pcm_s16le``) stream in a WAV container instead of
     the AAC stream used for muxed video.
     """
     validate_audio_waveform(audio)
+    if audio_marker is not None:
+        audio = audio_marker.embed(audio)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     container = av.open(output_path, mode="w")
     audio_stream = container.add_stream("pcm_s16le", rate=audio.sampling_rate)
@@ -331,7 +411,6 @@ def _encode_chunks_threaded(
     stream: av.video.stream.VideoStream,
     av_format: str,
     chunks: Iterator[np.ndarray],
-    progress_total: int,
 ) -> None:
     """Run libx264 frame.encode + container.mux on a background thread while
     the caller produces numpy chunks on the current thread. The 1-slot queue
@@ -369,7 +448,7 @@ def _encode_chunks_threaded(
     encoder_thread = threading.Thread(target=encoder_worker, name="h264-encoder")
     encoder_thread.start()
     try:
-        for arr in tqdm(chunks, total=progress_total):
+        for arr in chunks:
             chunk_queue.put(arr)
     finally:
         chunk_queue.put(None)

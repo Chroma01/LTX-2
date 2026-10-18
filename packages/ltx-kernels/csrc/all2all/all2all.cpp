@@ -61,7 +61,7 @@ All2All::All2All(int rank, int world_size, int num_tokens, int hidden_dim, int n
 
   // Calculate sizes for each region of the shared memory block
   int64_t ptrs_bytes = MAX_NUM_PEERS * sizeof(void *);
-  int64_t barrier_signal_bytes = MAX_NUM_PEERS * sizeof(int);
+  int64_t barrier_signal_bytes = kNumSignalSlots * sizeof(int);
   int64_t barrier_signal_ptrs_bytes = MAX_NUM_PEERS * sizeof(int *);
 
   // Allocate the main shared memory block and create IPC handle
@@ -320,6 +320,97 @@ at::Tensor All2All::allgather(at::Tensor &x, bool copy_output) {
   return get_local_buffer_tensor(x, batch_size, out_tokens, out_heads, head_size, copy_output, stream);
 }
 
+void All2All::rope_send_recv_heads(at::Tensor &x, at::Tensor &sin_freqs, at::Tensor &cos_freqs, at::Tensor &weights,
+                                   double eps, bool barrier) {
+  EP_HOST_ASSERT(x.dim() == 3 and x.scalar_type() == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(tensor_dtype == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(x.device().is_cuda() and x.device().index() == rank);
+  EP_HOST_ASSERT(weights.scalar_type() == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(cos_freqs.dim() == 4 and sin_freqs.dim() == 4);
+  // The kernel walks x and weights from one base pointer each, so a strided input is made contiguous,
+  // as ops/rms_norm_split_rope.cpp does for x.
+  if (!x.is_contiguous()) {
+    x = x.contiguous();
+  }
+  if (!weights.is_contiguous()) {
+    weights = weights.contiguous();
+  }
+  int b = x.size(0);
+  int s = x.size(1);
+  int h = x.size(2);
+  int n = cos_freqs.size(1);
+  EP_HOST_ASSERT(int64_t(b) * s * world_size * (h / world_size) * int64_t(elementSize(tensor_dtype)) <= tensor_bytes);
+
+  // Same freq-table handling as ops/rms_norm_split_rope.cpp: innermost dim contiguous, outer strides
+  // forwarded, a batch-shared table expanded (stride 0) rather than copied.
+  if (cos_freqs.stride(-1) != 1) {
+    cos_freqs = cos_freqs.contiguous();
+  }
+  if (sin_freqs.stride(-1) != 1) {
+    sin_freqs = sin_freqs.contiguous();
+  }
+  if (cos_freqs.size(0) == 1 && b > 1) {
+    cos_freqs = cos_freqs.expand({b, n, cos_freqs.size(2), cos_freqs.size(3)});
+  }
+  if (sin_freqs.size(0) == 1 && b > 1) {
+    sin_freqs = sin_freqs.expand({b, n, sin_freqs.size(2), sin_freqs.size(3)});
+  }
+
+  at::cuda::CUDAGuard device_guard{x.device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  all2all_cuda::rope_scatter_heads_launch(x.data_ptr(), sin_freqs.data_ptr(), cos_freqs.data_ptr(), weights.data_ptr(),
+                                          static_cast<float>(eps), b, s, n, h, cos_freqs.stride(0), cos_freqs.stride(1),
+                                          cos_freqs.stride(2), sin_freqs.stride(0), sin_freqs.stride(1),
+                                          sin_freqs.stride(2), buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank,
+                                          world_size, timeout_cycles_, barrier, stream);
+}
+
+void All2All::linear_send_recv_heads(at::Tensor &x, at::Tensor &weight, at::Tensor &bias, bool barrier) {
+  // A blockwise-fp8 exchange quantizes in its own copy kernel; this path writes the GEMM's bf16 output.
+  EP_HOST_ASSERT(tensor_dtype == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(x.dim() == 3 and x.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(weight.dim() == 2 and weight.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(bias.dim() == 1 and bias.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(x.device().is_cuda() and x.device().index() == rank);
+  int b = x.size(0);
+  int s = x.size(1);
+  int h = weight.size(0);
+  EP_HOST_ASSERT(h % world_size == 0);
+  int64_t cols = h / world_size;
+  int64_t total_tokens = int64_t(s) * world_size;
+  EP_HOST_ASSERT(int64_t(b) * total_tokens * cols * int64_t(elementSize(tensor_dtype)) <= tensor_bytes);
+
+  at::cuda::CUDAGuard device_guard{x.device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto options = x.options();
+  // Peers first, so the NVLink-bound writes start as early as possible.
+  for (int step = 1; step <= world_size; step++) {
+    int target = (rank + step) % world_size;
+    auto w = weight.narrow(0, target * cols, cols);
+    auto bias_slice = bias.narrow(0, target * cols, cols);
+    for (int batch = 0; batch < b; batch++) {
+      int64_t offset = (int64_t(batch) * total_tokens + int64_t(rank) * s) * cols;
+      // A peer buffer is IPC-mapped into this device's address space; pinning the target device skips the
+      // pointer-owner lookup, which would report the peer.
+      auto out =
+          at::for_blob(static_cast<uint8_t *>(buffer_ptrs[target]) + offset * elementSize(tensor_dtype), {s, cols})
+              .options(options)
+              .target_device(x.device())
+              .make_tensor();
+      at::addmm_out(out, bias_slice, x.select(0, batch), w.t());
+    }
+  }
+  if (barrier) {
+    all2all_cuda::fused_barrier_launch(barrier_signal_ptrs_gpu, rank, world_size, timeout_cycles_, stream);
+  }
+}
+
+void All2All::exchange_barrier() {
+  at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(rank)};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  all2all_cuda::fused_barrier_launch(barrier_signal_ptrs_gpu, rank, world_size, timeout_cycles_, stream);
+}
+
 } // namespace all2all
 } // namespace ltx_kernels
 
@@ -376,6 +467,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("gather_heads", &ltx_kernels::all2all::All2All::gather_heads,
            "Inverse All2All to gather heads back to original distribution.")
       .def("allgather", &ltx_kernels::all2all::All2All::allgather, "Gathers sequence tokens from all ranks.")
+      .def("rope_send_recv_heads", &ltx_kernels::all2all::All2All::rope_send_recv_heads,
+           "Fused RMS-norm + split RoPE written straight into every rank's head-exchange buffer.")
+      .def("linear_send_recv_heads", &ltx_kernels::all2all::All2All::linear_send_recv_heads,
+           "Linear projection written straight into every rank's head-exchange buffer.")
+      .def("exchange_barrier", &ltx_kernels::all2all::All2All::exchange_barrier,
+           "Waits until every rank's earlier writes on this stream are visible to every rank.")
       .def("set_timeout_seconds", &ltx_kernels::all2all::All2All::set_timeout_seconds,
            "Sets the barrier timeout in seconds (converted to cycles via the device peak SM clock).");
 }

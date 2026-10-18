@@ -44,6 +44,70 @@ def _gather_heads_fake(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> N
     return None
 
 
+@custom_op("ltx_kernels::rope_send_recv_heads", mutates_args=("buffer",), device_types="cuda")
+def _rope_send_recv_heads_op(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    cos_freqs: torch.Tensor,
+    sin_freqs: torch.Tensor,
+    eps: float,
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,
+    barrier: bool = True,
+) -> None:
+    All2All._runtime_registry[comm_id].rope_send_recv_heads(x, sin_freqs, cos_freqs, weights, eps, barrier)
+
+
+@_rope_send_recv_heads_op.register_fake
+def _rope_send_recv_heads_fake(
+    x: torch.Tensor,  # noqa: ARG001
+    weights: torch.Tensor,  # noqa: ARG001
+    cos_freqs: torch.Tensor,  # noqa: ARG001
+    sin_freqs: torch.Tensor,  # noqa: ARG001
+    eps: float,  # noqa: ARG001
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,  # noqa: ARG001
+    barrier: bool = True,  # noqa: ARG001
+) -> None:
+    return None
+
+
+@custom_op("ltx_kernels::linear_send_recv_heads", mutates_args=("buffer",), device_types="cuda")
+def _linear_send_recv_heads_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,
+    barrier: bool = True,
+) -> None:
+    All2All._runtime_registry[comm_id].linear_send_recv_heads(x, weight, bias, barrier)
+
+
+@_linear_send_recv_heads_op.register_fake
+def _linear_send_recv_heads_fake(
+    x: torch.Tensor,  # noqa: ARG001
+    weight: torch.Tensor,  # noqa: ARG001
+    bias: torch.Tensor,  # noqa: ARG001
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,  # noqa: ARG001
+    barrier: bool = True,  # noqa: ARG001
+) -> None:
+    return None
+
+
+@custom_op("ltx_kernels::exchange_barrier", mutates_args=("buffers",), device_types="cuda")
+def _exchange_barrier_op(buffers: list[torch.Tensor], comm_id: int) -> None:  # noqa: ARG001
+    # ``buffers`` are the exchanges this barrier completes: declaring them mutated orders every read of
+    # them after it.
+    All2All._runtime_registry[comm_id].exchange_barrier()
+
+
+@_exchange_barrier_op.register_fake
+def _exchange_barrier_fake(buffers: list[torch.Tensor], comm_id: int) -> None:  # noqa: ARG001
+    return None
+
+
 class All2All:
     """IPC-based All2All communication for distributed head-parallel attention.
     This class manages GPU memory buffers and IPC handles to enable efficient

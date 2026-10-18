@@ -5,6 +5,7 @@ No ``DiffusionStage`` / Gemma / ``ModelPaths``. Imported by ``dfr_stages`` and `
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 
@@ -15,7 +16,8 @@ from PIL import Image
 from ltx_core.conditioning import ConditioningItem, VideoConditionByKeyframeIndex, VideoConditionByLatentIndex
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
-from ltx_pipelines.utils.types import ImageConditioningInput
+from ltx_pipelines.dfr_helpers.lanczos import lanczos_x2_u8_hwc, rgb_to_uint8_fhwc
+from ltx_pipelines.utils.types import LoadedImageConditioning
 
 logger = logging.getLogger(__name__)
 
@@ -36,32 +38,43 @@ def conditioning_fps(playback_fps: float) -> float:
     return MAX_CONDITIONING_FPS if playback_fps > SNAP_CONDITIONING_FPS_ABOVE else playback_fps
 
 
-# HDR stage-2 spatial overlap. Temporal windows are sequential and pinned; spatial tiles inside
-# a time window blend after every Euler step; time windows are not blended. The first detailing
-# step is 2x2; remaining steps retile to 4x4. A two-value schedule stays 2x2.
-EPILOGUE_SPATIAL_OVERLAP = 10
-EPILOGUE_SPATIAL_COARSE_TILES = 2
-EPILOGUE_SPATIAL_TILES = 4
+# Spatial epilogue tiling. Temporal windows are sequential and pinned and are not blended; spatial
+# tiles inside a time window blend after every Euler step. Every step uses one grid of tiles at most
+# EPILOGUE_TILE_CELLS latent cells per side, overlapping by EPILOGUE_SPATIAL_OVERLAP cells: the blend
+# only has to hide two tiles' per-step disagreement on the shared cells, which 2 cells (64 px) keep
+# within ~0.5 dB of the rest of the frame.
+EPILOGUE_SPATIAL_OVERLAP = 2
+EPILOGUE_TILE_CELLS = 32
 EPILOGUE_KEYFRAME_STRENGTH = 1.0
 DETAILING_LORA_STRENGTH = 0.5
 
 
+def epilogue_tile_count(cells: int) -> int:
+    """Tiles along a latent axis of ``cells`` cells: the fewest whose overlapping tiles fit ``EPILOGUE_TILE_CELLS``."""
+    stride = EPILOGUE_TILE_CELLS - EPILOGUE_SPATIAL_OVERLAP
+    return max(1, math.ceil((cells - EPILOGUE_SPATIAL_OVERLAP) / stride))
+
+
 def lanczos_x2_fhwc(frames: torch.Tensor) -> torch.Tensor:
-    """Stretch each RGB frame 2x with Lanczos. ``frames`` is ``(F, H, W, C)`` in ``[0, 1]``."""
+    """Stretch each RGB frame 2x with Lanczos. ``frames`` is ``(F, H, W, C)`` in ``[0, 1]``.
+    CUDA frames are resampled on their device by :mod:`ltx_pipelines.dfr_helpers.lanczos`, CPU
+    frames by Pillow; both quantize to bytes first and return the same pixels.
+    """
     if frames.ndim != 4:
         raise ValueError(f"Expected (F, H, W, C) RGB, got shape {tuple(frames.shape)}")
     if frames.shape[0] < 1:
         raise ValueError("Need at least one frame to Lanczos-upsample")
+    if frames.shape[-1] not in (1, 3):
+        raise ValueError(f"Lanczos x2 expects 1 or 3 channels, got {frames.shape[-1]}")
+    if frames.is_cuda:
+        resized = torch.stack([lanczos_x2_u8_hwc(frame) for frame in rgb_to_uint8_fhwc(frames)]).float()
+        # A tensor divisor keeps this an IEEE division, as on the host (a Python scalar becomes a reciprocal multiply).
+        return resized / torch.full((), 255.0, device=resized.device)
     out: list[torch.Tensor] = []
     for frame in frames:
         height, width, channels = frame.shape
-        array = (frame.detach().float().clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
-        if channels == 1:
-            image = Image.fromarray(array[..., 0], mode="L")
-        elif channels == 3:
-            image = Image.fromarray(array, mode="RGB")
-        else:
-            raise ValueError(f"Lanczos x2 expects 1 or 3 channels, got {channels}")
+        array = rgb_to_uint8_fhwc(frame).numpy()
+        image = Image.fromarray(array[..., 0], mode="L") if channels == 1 else Image.fromarray(array, mode="RGB")
         image = image.resize((width * 2, height * 2), resample=Image.Resampling.LANCZOS)
         resized = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0)
         if resized.ndim == 2:
@@ -279,22 +292,28 @@ def lead_in_carryover(
 
 
 def rebase_image_conditionings(
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     *,
     pixel_scale: int,
     pixel_start: int = 0,
     pixel_end: int | None = None,
-) -> list[ImageConditioningInput]:
+) -> list[LoadedImageConditioning]:
     """Map user ``frame_idx`` values from the requested canvas onto a temporally-upsampled grid.
     After ``r`` temporal rounds the same moment sits at ``frame_idx * 2**r``. When ``pixel_end`` is
     set, only images inside ``[pixel_start, pixel_end]`` are kept and indices become tile-local.
     """
-    rebased: list[ImageConditioningInput] = []
-    for image in images:
-        scaled = image.frame_idx * pixel_scale
+
+    def map_frame(frame_idx: int) -> int | None:
+        scaled = frame_idx * pixel_scale
         if pixel_end is not None and not (pixel_start <= scaled <= pixel_end):
-            continue
-        rebased.append(ImageConditioningInput(image.path, scaled - pixel_start, image.strength, image.crf))
+            return None
+        return scaled - pixel_start
+
+    rebased: list[LoadedImageConditioning] = []
+    for image in images:
+        rebased_image = image.map_frame_index(map_frame)
+        if rebased_image is not None:
+            rebased.append(rebased_image)
     return rebased
 
 

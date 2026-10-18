@@ -140,10 +140,11 @@ def _load_function(file_name: str, function_prefix: str) -> CompiledFunction:
 @functools.lru_cache(maxsize=8)
 def production_kernel_keys(gpu_arch: str) -> tuple[KernelKey, ...]:
     """Return the finite production specialization set for ``gpu_arch``."""
-    from ltx_kernels.vae import block_fna_dsl, na_attn_dsl  # noqa: PLC0415
+    from ltx_kernels.vae import block_fna_dsl, na_attn_dsl, rope_dsl  # noqa: PLC0415
 
     na = na_attn_dsl._compile_kernel
     block = block_fna_dsl._compile_kernel
+    rope = rope_dsl._compile_kernel
     return (
         KernelKey.create(
             na,
@@ -204,6 +205,11 @@ def production_kernel_keys(gpu_arch: str) -> tuple[KernelKey, ...]:
             tile_thw=(4, 4, 8),
             slab_box_max=block_fna_dsl.SLAB_BOX_MAX,
             keyframes=True,
+        ),
+        KernelKey.create(
+            rope,
+            gpu_arch,
+            rope_dims=(16, 24, 24),
         ),
     )
 

@@ -12,6 +12,7 @@ from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
 from ltx_core.model.transformer.transformer_args import (
+    AdaLNTimestepEmbedding,
     BlockPerturbationsProcessor,
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -471,9 +472,10 @@ class LTXModel(torch.nn.Module, Disposable):
         norm_out: torch.nn.LayerNorm,
         proj_out: torch.nn.Linear,
         x: torch.Tensor,
-        embedded_timestep: torch.Tensor,
+        timestep_embedding: AdaLNTimestepEmbedding,
     ) -> torch.Tensor:
         """Process output for LTXV."""
+        embedded_timestep = timestep_embedding.per_token_embedding()
         # Apply scale-shift modulation
         scale_shift_values = (
             scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
@@ -515,7 +517,11 @@ class LTXModel(torch.nn.Module, Disposable):
         # Process output
         vx = (
             self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
+                self.scale_shift_table,
+                self.norm_out,
+                self.proj_out,
+                video_out.x,
+                video_out.timestep_embedding,
             )
             if video_out is not None
             else None
@@ -526,7 +532,7 @@ class LTXModel(torch.nn.Module, Disposable):
                 self.audio_norm_out,
                 self.audio_proj_out,
                 audio_out.x,
-                audio_out.embedded_timestep,
+                audio_out.timestep_embedding,
             )
             if audio_out is not None
             else None
@@ -595,6 +601,6 @@ class X0Model(torch.nn.Module, Disposable):
             Denoised video and audio
         """
         vx, ax = self.velocity_model(video, audio, perturbations)
-        denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
-        denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
+        denoised_video = to_denoised(video.latent, vx, video.timesteps.per_token()) if vx is not None else None
+        denoised_audio = to_denoised(audio.latent, ax, audio.timesteps.per_token()) if ax is not None else None
         return denoised_video, denoised_audio

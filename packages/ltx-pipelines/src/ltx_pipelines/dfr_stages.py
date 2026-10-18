@@ -21,6 +21,7 @@ import torch
 
 from ltx_core.components.noisers import GaussianNoiser, Noiser
 from ltx_core.conditioning import ConditioningItem, VideoConditionByReferenceLatent, VideoGeneratedKeyframeSlots
+from ltx_core.devices import upload_from_host
 from ltx_core.model.video_vae import VideoEncoder
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
 from ltx_core.tools import LatentTools, VideoLatentTools
@@ -29,14 +30,13 @@ from ltx_pipelines.dfr_helpers.layout import TemporalTile, TemporalTilePlan
 from ltx_pipelines.dfr_helpers.ops import (
     ANCHOR_KEYFRAME_STRENGTH,
     EPILOGUE_KEYFRAME_STRENGTH,
-    EPILOGUE_SPATIAL_COARSE_TILES,
     EPILOGUE_SPATIAL_OVERLAP,
-    EPILOGUE_SPATIAL_TILES,
     TEMPORAL_ANCESTRAL_ETA,
     TilePrefix,
     audio_latent_for_tile,
     clamp_tile_to_latent,
     conditioning_fps,
+    epilogue_tile_count,
     keyframe_conditionings_from_latents,
     lanczos_x2_fhwc,
     lead_in_carryover,
@@ -47,14 +47,14 @@ from ltx_pipelines.dfr_helpers.ops import (
 from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, VideoDecoder, VideoUpsampler
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
-    combined_image_conditionings,
     create_initial_audio_latent,
     create_initial_video_latent,
+    image_conditionings,
 )
 from ltx_pipelines.utils.media_io import to_vae_range
 from ltx_pipelines.utils.samplers import euler_ancestral_denoising_loop
 from ltx_pipelines.utils.tiled_diffusion import TiledDiffusionModel
-from ltx_pipelines.utils.types import ImageConditioningInput, ModalitySpec, VideoAudio
+from ltx_pipelines.utils.types import LoadedImageConditioning, ModalitySpec, VideoAudio
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ def _stack_keyframes(keyframes: KeyframeCarry) -> tuple[list[int], torch.Tensor]
 
 def _image_conditionings(
     image_conditioner: ImageConditioner,
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     *,
     height: int,
     width: int,
@@ -160,7 +160,7 @@ def _image_conditionings(
     device: torch.device,
 ) -> list[ConditioningItem]:
     return image_conditioner(
-        lambda enc: combined_image_conditionings(
+        lambda enc: image_conditionings(
             images=list(images),
             height=height,
             width=width,
@@ -174,7 +174,7 @@ def _image_conditionings(
 def _prepare_stage1_specs(
     *,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     video_shape: VideoPixelShape,
     positions: Sequence[int],
     video_context: torch.Tensor,
@@ -229,7 +229,7 @@ def _prepare_stage2_specs(  # noqa: PLR0913
     *,
     upsampler: VideoUpsampler,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     video_shape: VideoPixelShape,
     keyframes: KeyframeCarry,
     half_res_reference: torch.Tensor,
@@ -287,7 +287,7 @@ def denoise_stage1(  # noqa: PLR0913
     *,
     stage: DiffusionStage,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     video_shape: VideoPixelShape,
     positions: Sequence[int],
     video_context: torch.Tensor,
@@ -306,7 +306,8 @@ def denoise_stage1(  # noqa: PLR0913
     ``1.0``, which would noise the latent before freezing it).
     Transformer fps snaps above 30; audio duration stays at playback ``video_shape.fps``.
     """
-    sigmas = sigmas.to(dtype=torch.float32, device=device)
+    # Kept on the host: the loop uploads the schedule, and host reads of it stay free.
+    sigmas = sigmas.to(dtype=torch.float32)
     prepared = _prepare_stage1_specs(
         image_conditioner=image_conditioner,
         images=images,
@@ -344,7 +345,7 @@ def denoise_stage2(  # noqa: PLR0913
     stage: DiffusionStage,
     image_conditioner: ImageConditioner,
     upsampler: VideoUpsampler,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     video_shape: VideoPixelShape,
     keyframes: KeyframeCarry,
     half_res_reference: torch.Tensor,
@@ -362,7 +363,8 @@ def denoise_stage2(  # noqa: PLR0913
     Upsamples ``half_res_reference`` and ``keyframes`` as its first step, matching temporal
     rounds and the epilogue. Audio is re-noised for cross-modal attention only.
     """
-    sigmas = sigmas.to(dtype=torch.float32, device=device)
+    # Kept on the host: the loop uploads the schedule, and host reads of it stay free.
+    sigmas = sigmas.to(dtype=torch.float32)
     prepared = _prepare_stage2_specs(
         upsampler=upsampler,
         image_conditioner=image_conditioner,
@@ -425,7 +427,7 @@ def _temporal_tile_video_input(
 def _temporal_tile_conditionings(  # noqa: PLR0913
     *,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     canvas: VideoPixelShape,
     tile_video: TemporalTileVideo,
     tile: TemporalTile,
@@ -499,7 +501,7 @@ def _temporal_tile_conditionings(  # noqa: PLR0913
 def _prepare_temporal_tile_specs(  # noqa: PLR0913
     *,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     canvas: VideoPixelShape,
     video_latent: torch.Tensor,
     tile_index: int,
@@ -606,7 +608,7 @@ def _denoise_temporal_tile(  # noqa: PLR0913
     *,
     stage: DiffusionStage,
     image_conditioner: ImageConditioner,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     canvas: VideoPixelShape,
     video_latent: torch.Tensor,
     tile_index: int,
@@ -683,7 +685,7 @@ def run_one_temporal_round(  # noqa: PLR0913
     video_state: LatentState,
     keyframes: KeyframeCarry,
     video_shape: VideoPixelShape,
-    images: list[ImageConditioningInput],
+    images: list[LoadedImageConditioning],
     video_context: torch.Tensor,
     audio_context: torch.Tensor,
     audio_latent: torch.Tensor,
@@ -751,51 +753,47 @@ def run_one_temporal_round(  # noqa: PLR0913
     return next_video_state, dict(sorted(plane_at.items())), seam_positions
 
 
-def _decode_carry_keyframes(
+def _rebuild_carry_keyframes(
     video_decoder: VideoDecoder,
+    image_conditioner: ImageConditioner,
     keyframes: KeyframeCarry,
     *,
     seed: int,
     device: torch.device,
-) -> dict[int, torch.Tensor]:
-    """Decode each carry keyframe as its own 1-frame RGB clip.
-    The VAE is causal, so a stacked encode/decode would bleed neighbouring planes. Each
-    plane is a standalone one-pixel-frame latent, matching ``DecodeKeyframes``. Dist
-    ``decode_single_frames`` splits the planes across the ranks and gathers them back, so
-    every rank gets every plane instead of the empty worker yield from ``decode_video``.
-    Generators are per plane, which keeps the pixels independent of the world size.
+    dtype: torch.dtype,
+) -> KeyframeCarry:
+    """Decode, Lanczos-x2 and re-encode each carry plane on the rank that owns it.
+    Each plane is a standalone one-pixel-frame clip with its own generator, so its pixels do
+    not depend on the world size. A Dist decoder splits the planes round-robin over the group;
+    each rank resamples and encodes its own planes and only the small encoded latents cross the
+    group. The Lanczos runs on the decode device right after each plane; every encode is queued
+    before any read-back. Returns every plane on every rank.
     """
     for position, plane in keyframes.items():
         if plane.ndim != 5 or plane.shape[2] != 1:
             raise ValueError(f"Expected one keyframe plane at {position}, got {tuple(plane.shape)}")
-    n_planes = len(keyframes)
-    logger.info("Epilogue: decoding %d carry keyframes separately", n_planes)
-    planes = list(keyframes.values())
-    generators = [torch.Generator(device=device).manual_seed(seed + 4000 + index) for index in range(n_planes)]
-    rgb_planes: list[torch.Tensor] = []
-    for index, rgb in enumerate(video_decoder.decode_single_frames(planes, generators)):
+    positions = list(keyframes)
+    logger.info("Epilogue: decoding %d carry keyframes separately", len(positions))
+    generators = [torch.Generator(device=device).manual_seed(seed + 4000 + index) for index in range(len(positions))]
+    owned = video_decoder.decode_owned_single_frames(list(keyframes.values()), generators)
+
+    resampled: dict[int, torch.Tensor] = {}
+    for index, rgb in zip(owned.indices, owned.planes, strict=True):
         if rgb.shape[0] < 1:
             raise RuntimeError(f"Decoder returned no pixels for carry keyframe {index}")
-        rgb_planes.append(rgb.detach().cpu())
-    if len(rgb_planes) != n_planes:
-        raise RuntimeError(f"Expected {n_planes} decoded carry keyframes, got {len(rgb_planes)}")
-    return dict(zip(keyframes, rgb_planes, strict=True))
+        resampled[index] = lanczos_x2_fhwc(rgb.detach())
 
+    def encode(enc: VideoEncoder) -> dict[int, torch.Tensor]:
+        on_device = {}
+        for index, rgb in resampled.items():
+            sample = to_vae_range(rgb.to(device=device, dtype=torch.float32))
+            on_device[index] = enc(sample.permute(3, 0, 1, 2).unsqueeze(0).contiguous().to(dtype=dtype))
+        return {index: plane.cpu() for index, plane in on_device.items()}
 
-def _encode_keyframe_pixels(
-    enc: VideoEncoder,
-    pixel_keyframes: dict[int, torch.Tensor],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> KeyframeCarry:
-    """Encode each Lanczos RGB clip as a one-frame latent plane."""
-
-    def encode(rgb: torch.Tensor) -> torch.Tensor:
-        sample = to_vae_range(rgb.to(device=device, dtype=torch.float32))
-        return enc(sample.permute(3, 0, 1, 2).unsqueeze(0).contiguous().to(dtype=dtype))
-
-    return {position: encode(rgb) for position, rgb in pixel_keyframes.items()}
+    encoded = owned.gather(image_conditioner(encode))
+    if len(encoded) != len(positions):
+        raise RuntimeError(f"Expected {len(positions)} encoded carry keyframes, got {len(encoded)}")
+    return {position: upload_from_host(encoded[index], device) for index, position in enumerate(positions)}
 
 
 def _rebuild_epilogue_keyframes(
@@ -804,24 +802,21 @@ def _rebuild_epilogue_keyframes(
     image_conditioner: ImageConditioner,
     keyframes: KeyframeCarry,
     video_state: LatentState,
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     temporal_upscalings: int,
     seed: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[KeyframeCarry, torch.Tensor | None]:
-    """Decode carry planes, Lanczos-x2, and encode. Opening plane if no frame-0 image.
-    Decoder is freed before the encoder is built: decode completes, then
-    ``image_conditioner`` loads the encoder for the RGB planes only.
-    """
+    """Rebuild the carry planes at the epilogue resolution, plus the opening plane if no image conditions frame 0."""
     opening_position = -1
     to_decode = dict(keyframes)
     epi_images = rebase_image_conditionings(images, pixel_scale=2**temporal_upscalings)
     if not any(image.frame_idx == 0 for image in epi_images):
         to_decode[opening_position] = video_state.latent[:1, :, :1]
-    pixel_keyframes = _decode_carry_keyframes(video_decoder, to_decode, seed=seed, device=device)
-    pixel_keyframes = {position: lanczos_x2_fhwc(rgb) for position, rgb in pixel_keyframes.items()}
-    encoded = image_conditioner(lambda enc: _encode_keyframe_pixels(enc, pixel_keyframes, dtype=dtype, device=device))
+    encoded = _rebuild_carry_keyframes(
+        video_decoder, image_conditioner, to_decode, seed=seed, device=device, dtype=dtype
+    )
     opening = encoded.pop(opening_position, None)
     return encoded, opening
 
@@ -1004,7 +999,7 @@ def _execute_tiled_spatial_denoise(
     )
     video_state, _ = tiled_stage(
         denoiser=SimpleDenoiser(video_context, audio_context),
-        sigmas=sigmas.to(dtype=torch.float32, device=device),
+        sigmas=sigmas.to(dtype=torch.float32),
         noiser=GaussianNoiser(generator=torch.Generator(device=device).manual_seed(seed + 2000)),
         modalities=VideoAudio(video=prepared.video, audio=prepared.audio),
         loop=loop,
@@ -1046,92 +1041,89 @@ def _run_epilogue_windows(  # noqa: PLR0913
     temporal_scale: int,
     loop: Callable[..., tuple[LatentState | None, LatentState | None]] | None = None,
 ) -> torch.Tensor:
-    """Detail each temporal window with one coarse-grid step, then any remaining steps on the fine grid."""
+    """Detail each temporal window with one step, then any remaining steps, on one spatial tile grid."""
     stitched: list[torch.Tensor] = []
     previous: tuple[int, torch.Tensor] | None = None
     coarse_sigmas, fine_sigmas = _epilogue_sigma_phases(sigmas)
-    coarse_tiling = TileCountConfig(
+    tiling = TileCountConfig(
         frames=DimensionTilingConfig(1, overlap=0),
-        height=DimensionTilingConfig(EPILOGUE_SPATIAL_COARSE_TILES, EPILOGUE_SPATIAL_OVERLAP),
-        width=DimensionTilingConfig(EPILOGUE_SPATIAL_COARSE_TILES, EPILOGUE_SPATIAL_OVERLAP),
+        height=DimensionTilingConfig(epilogue_tile_count(int(latent.shape[3])), EPILOGUE_SPATIAL_OVERLAP),
+        width=DimensionTilingConfig(epilogue_tile_count(int(latent.shape[4])), EPILOGUE_SPATIAL_OVERLAP),
     )
     scale_factors = stage.video_scale_factors
-    for index, window in enumerate(windows):
-        prepared_window = _prepare_epilogue_window_specs(
-            index=index,
-            num_windows=len(windows),
-            window=window,
-            prefix=prefixes[index],
-            latent=latent,
-            guide=guide,
-            plane_at=keyframes,
-            window_images=window_images[index],
-            keyframes=keyframes,
-            opening_plane=opening_plane,
-            previous=previous,
-            downscale_factor=downscale_factor,
-            canvas=canvas,
-            audio_latent=audio_latent,
-            source_duration=source_duration,
-            video_context=video_context,
-            audio_context=audio_context,
-            noise_scale=float(coarse_sigmas[0].item()),
-            temporal_scale=temporal_scale,
-            scale_factors=scale_factors,
-            device=device,
-            dtype=dtype,
-        )
-        window_latent = _execute_tiled_spatial_denoise(
-            stage,
-            prepared=prepared_window.denoise,
-            latent=prepared_window.window_latent,
-            tiling=coarse_tiling,
-            sigmas=coarse_sigmas,
-            video_context=video_context,
-            audio_context=audio_context,
-            seed=seed + 100 * index,
-            device=device,
-            loop=loop,
-        )
-        if fine_sigmas is not None:
-            fine_tiling = TileCountConfig(
-                frames=DimensionTilingConfig(1, overlap=0),
-                height=DimensionTilingConfig(EPILOGUE_SPATIAL_TILES, EPILOGUE_SPATIAL_OVERLAP),
-                width=DimensionTilingConfig(EPILOGUE_SPATIAL_TILES, EPILOGUE_SPATIAL_OVERLAP),
-            )
-            audio_latent_in = prepared_window.denoise.audio.latent
-            if audio_latent_in is None:
-                raise RuntimeError("Epilogue window prepared no audio latent")
-            fine_prepared = _prepare_tiled_spatial_denoise_specs(
-                latent=window_latent,
-                conditionings=list(prepared_window.denoise.video.conditionings),
+    # One transformer for every window and tile instead of a build per tile.
+    with stage.resident():
+        for index, window in enumerate(windows):
+            prepared_window = _prepare_epilogue_window_specs(
+                index=index,
+                num_windows=len(windows),
+                window=window,
+                prefix=prefixes[index],
+                latent=latent,
+                guide=guide,
+                plane_at=keyframes,
+                window_images=window_images[index],
+                keyframes=keyframes,
+                opening_plane=opening_plane,
+                previous=previous,
+                downscale_factor=downscale_factor,
+                canvas=canvas,
+                audio_latent=audio_latent,
+                source_duration=source_duration,
                 video_context=video_context,
                 audio_context=audio_context,
-                audio_latent=audio_latent_in,
-                fps=prepared_window.denoise.canvas.fps,
+                noise_scale=float(coarse_sigmas[0].item()),
+                temporal_scale=temporal_scale,
                 scale_factors=scale_factors,
                 device=device,
                 dtype=dtype,
-                noise_scale=0.0,
             )
             window_latent = _execute_tiled_spatial_denoise(
                 stage,
-                prepared=fine_prepared,
-                latent=window_latent,
-                tiling=fine_tiling,
-                sigmas=fine_sigmas,
+                prepared=prepared_window.denoise,
+                latent=prepared_window.window_latent,
+                tiling=tiling,
+                sigmas=coarse_sigmas,
                 video_context=video_context,
                 audio_context=audio_context,
                 seed=seed + 100 * index,
                 device=device,
                 loop=loop,
             )
-        prefix = prepared_window.prefix
-        previous = (
-            prefix.video_start_cell - 1 if prefix else prepared_window.interval_start,
-            window_latent.detach(),
-        )
-        stitched.append(window_latent[:, :, prepared_window.pinned_cells :])
+            if fine_sigmas is not None:
+                audio_latent_in = prepared_window.denoise.audio.latent
+                if audio_latent_in is None:
+                    raise RuntimeError("Epilogue window prepared no audio latent")
+                fine_prepared = _prepare_tiled_spatial_denoise_specs(
+                    latent=window_latent,
+                    conditionings=list(prepared_window.denoise.video.conditionings),
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    audio_latent=audio_latent_in,
+                    fps=prepared_window.denoise.canvas.fps,
+                    scale_factors=scale_factors,
+                    device=device,
+                    dtype=dtype,
+                    noise_scale=0.0,
+                )
+                window_latent = _execute_tiled_spatial_denoise(
+                    stage,
+                    prepared=fine_prepared,
+                    latent=window_latent,
+                    tiling=tiling,
+                    sigmas=fine_sigmas,
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    seed=seed + 100 * index,
+                    device=device,
+                    loop=loop,
+                )
+            prefix = prepared_window.prefix
+            previous = (
+                prefix.video_start_cell - 1 if prefix else prepared_window.interval_start,
+                window_latent.detach(),
+            )
+            stitched.append(window_latent[:, :, prepared_window.pinned_cells :])
     return torch.cat(stitched, dim=2)
 
 
@@ -1165,7 +1157,7 @@ def _encode_epilogue_window_images(
     *,
     windows: TemporalTilePlan,
     prefixes: Sequence[TilePrefix | None],
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     temporal_upscalings: int,
     video_shape: VideoPixelShape,
     dtype: torch.dtype,
@@ -1188,7 +1180,7 @@ def _encode_epilogue_window_images(
             if image.frame_idx + origin >= resume
         ]
         per_window.append(
-            combined_image_conditionings(
+            image_conditionings(
                 images=inside,
                 height=video_shape.height,
                 width=video_shape.width,
@@ -1210,7 +1202,7 @@ def run_spatial_epilogue(  # noqa: PLR0913
     video_decoder: VideoDecoder,
     video_state: LatentState,
     keyframes: KeyframeCarry,
-    images: Sequence[ImageConditioningInput],
+    images: Sequence[LoadedImageConditioning],
     video_shape: VideoPixelShape,
     temporal_upscalings: int,
     last_window_seams: Sequence[int],

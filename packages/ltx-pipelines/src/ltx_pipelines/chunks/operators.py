@@ -270,6 +270,8 @@ def _decode_chunk_video(
     decoded_batches = list(video_decoder(chunk.video, tiling_config, generator, **decode_kwargs))
     if not decoded_batches:
         return None
+    if len(decoded_batches) == 1:
+        return decoded_batches[0]
     return torch.cat(decoded_batches, dim=0)
 
 

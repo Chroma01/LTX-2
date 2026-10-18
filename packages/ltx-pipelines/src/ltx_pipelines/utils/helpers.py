@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,14 +10,12 @@ import torch
 from ltx_core.components.noisers import Noiser
 from ltx_core.conditioning import (
     ConditioningItem,
-    VideoConditionByKeyframeIndex,
-    VideoConditionByLatentIndex,
     VideoGeneratedKeyframeSlots,
 )
 from ltx_core.devices import activation_budget_bytes, cleanup_accelerator_memory, get_preferred_device
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae import encode_audio
-from ltx_core.model.transformer import Modality
+from ltx_core.model.transformer import Modality, TokenTimesteps
 from ltx_core.model.video_vae import AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
@@ -47,12 +46,11 @@ from ltx_pipelines.utils.media_io import (
     get_videostream_fps,
     is_exr_dir,
     load_exr_as_hdr_conditioning,
-    load_image_and_preprocess,
     resize_aspect_ratio_preserving,
     video_preprocess,
 )
 from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
-from ltx_pipelines.utils.types import ImageConditioningInput
+from ltx_pipelines.utils.types import LoadedImageConditioning
 
 if TYPE_CHECKING:
     from ltx_pipelines.utils.blocks import DiffusionStage
@@ -352,102 +350,16 @@ def audio_latent_from_file(
     return _conform_latent_length(latents, required_latent_frames)
 
 
-def combined_image_conditionings(
-    images: list[ImageConditioningInput],
+def image_conditionings(
+    images: Sequence[LoadedImageConditioning],
     height: int,
     width: int,
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
-    color_space: EXRColorSpace | None = None,
 ) -> list[ConditioningItem]:
-    """Create a list of conditionings by replacing the latent at the first frame with the encoded image if present
-    and using other encoded images as the keyframe conditionings."""
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        if img.frame_idx == 0:
-            conditioning = VideoConditionByLatentIndex(
-                latent=encoded_image,
-                strength=img.strength,
-                latent_idx=0,
-            )
-        else:
-            conditioning = VideoConditionByKeyframeIndex(
-                keyframes=encoded_image,
-                strength=img.strength,
-                frame_idx=img.frame_idx,
-            )
-        conditionings.append(conditioning)
-    return conditionings
-
-
-def image_conditionings_by_replacing_latent(
-    images: list[ImageConditioningInput],
-    height: int,
-    width: int,
-    video_encoder: VideoEncoder,
-    dtype: torch.dtype,
-    device: torch.device,
-    color_space: EXRColorSpace | None = None,
-) -> list[ConditioningItem]:
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        conditionings.append(
-            VideoConditionByLatentIndex(
-                latent=encoded_image,
-                strength=img.strength,
-                latent_idx=img.frame_idx,
-            )
-        )
-
-    return conditionings
-
-
-def image_conditionings_by_adding_guiding_latent(
-    images: list[ImageConditioningInput],
-    height: int,
-    width: int,
-    video_encoder: VideoEncoder,
-    dtype: torch.dtype,
-    device: torch.device,
-    color_space: EXRColorSpace | None = None,
-) -> list[ConditioningItem]:
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        conditionings.append(
-            VideoConditionByKeyframeIndex(keyframes=encoded_image, frame_idx=img.frame_idx, strength=img.strength)
-        )
-    return conditionings
+    """Encode loaded stills at ``height`` x ``width`` into conditioning items using each ``binding``."""
+    return [img.to_item(video_encoder(img.still.tensor(height, width, dtype, device))) for img in images]
 
 
 def evenly_spaced_keyframe_positions(num_keyframes: int, num_frames: int) -> list[int]:
@@ -574,9 +486,8 @@ def create_noised_state(
     """
     state = tools.create_initial_state(device, dtype, initial_latent)
     state = state_with_conditionings(state, conditionings, tools)
-    state = noiser(state, noise_scale)
-
-    return state
+    state = replace(state, denoise_mask=state.denoise_mask.compact(device))
+    return noiser(state, noise_scale)
 
 
 def state_with_conditionings(
@@ -612,11 +523,18 @@ def modality_from_latent_state(
     """
     if state.frozen:
         sigma = torch.zeros_like(sigma)
+    values = state.denoise_mask.values
+    timesteps = timesteps_from_mask(values.reshape(1, -1), sigma)
+    # Clamped because a mask value above the table's last entry would otherwise index one
+    # past it, and that read happens inside a captured CUDA graph.
+    timestep_indices = torch.searchsorted(
+        values, state.denoise_mask.tensor.reshape(state.latent.shape[0], -1), out_int32=True
+    ).clamp_(max=values.numel() - 1)
     return Modality(
         enabled=enabled,
         latent=state.latent,
         sigma=sigma,
-        timesteps=timesteps_from_mask(state.denoise_mask, sigma),
+        timesteps=TokenTimesteps(timesteps, timestep_indices, state.denoise_mask.zero_index),
         positions=state.positions,
         context=context,
         context_mask=None,

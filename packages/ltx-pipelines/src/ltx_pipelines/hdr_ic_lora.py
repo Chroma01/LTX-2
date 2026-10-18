@@ -25,7 +25,10 @@ from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import LatentState, SpatioTemporalScaleFactors, VideoPixelShape
 from ltx_pipelines.dfr_helpers.layout import resolve_canvas
-from ltx_pipelines.utils.args import hdr_ic_lora_arg_parser
+from ltx_pipelines.utils.args import (
+    hdr_ic_lora_arg_parser,
+    markers_from_args,
+)
 from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, VideoDecoder
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
@@ -527,6 +530,7 @@ class HDRICLoraPipeline:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = hdr_ic_lora_arg_parser().parse_args()
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=args.exr_colorspace)
 
     logger.info("Loading HDRICLoraPipeline...")
     pipeline = HDRICLoraPipeline(
@@ -554,6 +558,8 @@ def main() -> None:
         output_path=str(output_path),
         video_chunks_number=1,
         color_space=args.exr_colorspace,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
     logger.info("Done → %s (+ EXR)", args.output_path)
 

@@ -7,17 +7,21 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_pipelines.chunks import ChunkConfig
+from ltx_pipelines.marking import AudioMarker, VideoMarker, create_markers
 from ltx_pipelines.utils.constants import (
     DEFAULT_LORA_STRENGTH,
     DEFAULT_NEGATIVE_PROMPT,
     LTX_2_3_HQ_PARAMS,
     LTX_2_3_PARAMS,
     LTX_2_4_PARAMS,
+    VIDEO_SCALE_FACTORS,
     PipelineParams,
     detect_params,
 )
@@ -78,6 +82,44 @@ def add_hdr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
+def add_marker_root_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--marker-root-path``. Requires the ``videoseal`` and ``audioseal`` extras."""
+    parser.add_argument(
+        "--marker-root-path",
+        dest="marker_root_path",
+        type=resolve_existing_dir,
+        default=None,
+        help=(
+            "Path to a local path/to/marking pack directory (VideoSeal checkpoint/card/"
+            "attenuation and AudioSeal generator/detector). Stamps SDR pixels and stereo PCM. "
+            "HDR encode skips video and still stamps audio. "
+            "Requires the videoseal and audioseal extras. "
+            "Default: no marking."
+        ),
+    )
+    return parser
+
+
+def markers_from_args(
+    args: object,
+    device: torch.device,
+    color_space: EXRColorSpace | None = None,
+) -> tuple[VideoMarker | None, AudioMarker | None]:
+    """Load resident markers for this CLI, or ``(None, None)`` when the flag is omitted.
+    When ``--marker-root-path`` is set, both extras and pack files are checked
+    immediately. HDR (``color_space`` set) drops the video marker, stamps audio,
+    and logs that video marking is unavailable with HDR.
+    """
+    path = getattr(args, "marker_root_path", None)
+    if path is None:
+        return None, None
+    video_marker, audio_marker = create_markers(path, device)
+    if color_space is not None:
+        logger.warning("video marking is unavailable with HDR")
+        return None, audio_marker
+    return video_marker, audio_marker
+
+
 class VideoConditioningAction(argparse.Action):
     def __call__(
         self,
@@ -135,10 +177,21 @@ class AutoDurationAction(argparse.Action):
         setattr(namespace, self.dest, AutoDuration(min_seconds=min_seconds, max_seconds=max_seconds))
 
 
+def _append_image_conditioning(namespace: argparse.Namespace, dest: str, item: ImageConditioningInput) -> None:
+    current = getattr(namespace, dest) or []
+    current.append(item)
+    setattr(namespace, dest, current)
+
+
+_IMAGE_BINDING_KEYWORDS = frozenset({"auto", "replace", "guide"})
+
+
 class ImageAction(argparse.Action):
-    """Parse ``--image PATH FRAME_IDX STRENGTH [CRF]``.
-    An omitted CRF stays ``None``, which the pipeline resolves from the checkpoint it runs
-    (see ``ImageConditioner.resolve_crf``) -- the CLI does not need to know the value.
+    """Parse ``--image PATH FRAME_IDX STRENGTH [BINDING] [CRF]``.
+    ``BINDING`` is ``auto`` (default when omitted), ``replace``, or ``guide``. With ``auto``, frame 0
+    replaces the latent and later frames guide as keyframes. When only one trailing token is given,
+    a keyword selects ``BINDING`` and an integer selects ``CRF``. An omitted CRF stays ``None`` for
+    the pipeline to resolve from its checkpoint.
     """
 
     def __call__(
@@ -148,19 +201,43 @@ class ImageAction(argparse.Action):
         values: list[str],
         option_string: str | None = None,
     ) -> None:
-        if len(values) not in (3, 4):
-            msg = f"{option_string} requires 3 or 4 arguments (PATH FRAME_IDX STRENGTH [CRF]), got {len(values)}"
+        if len(values) not in (3, 4, 5):
+            msg = (
+                f"{option_string} requires 3 to 5 arguments "
+                f"(PATH FRAME_IDX STRENGTH [BINDING] [CRF]), got {len(values)}"
+            )
             raise argparse.ArgumentError(self, msg)
 
-        conditioning = ImageConditioningInput(
-            path=resolve_existing_path(values[0]),
-            frame_idx=int(values[1]),
-            strength=float(values[2]),
-            crf=int(values[3]) if len(values) > 3 else None,
-        )
-        current = getattr(namespace, self.dest) or []
-        current.append(conditioning)
-        setattr(namespace, self.dest, current)
+        path = resolve_existing_path(values[0])
+        frame_idx = int(values[1])
+        strength = float(values[2])
+        binding_mode = "auto"
+        crf: int | None = None
+
+        if len(values) == 4:
+            if values[3] in _IMAGE_BINDING_KEYWORDS:
+                binding_mode = values[3]
+            else:
+                crf = int(values[3])
+        elif len(values) == 5:
+            if values[3] not in _IMAGE_BINDING_KEYWORDS:
+                msg = f"{option_string} BINDING must be auto, replace, or guide, got {values[3]!r}"
+                raise argparse.ArgumentError(self, msg)
+            binding_mode = values[3]
+            crf = int(values[4])
+
+        match binding_mode:
+            case "auto":
+                image = ImageConditioningInput.at(path, frame_idx, strength, crf)
+            case "replace":
+                image = ImageConditioningInput.replace(path, frame_idx, strength, crf)
+            case "guide":
+                image = ImageConditioningInput.guide(path, frame_idx, strength, crf)
+            case _:
+                msg = f"{option_string} BINDING must be auto, replace, or guide, got {binding_mode!r}"
+                raise argparse.ArgumentError(self, msg)
+
+        _append_image_conditioning(namespace, self.dest, image)
 
 
 class LoraAction(argparse.Action):
@@ -316,6 +393,14 @@ def resolve_existing_path(path: str) -> str:
     resolved = resolve_path(path)
     if not Path(resolved).exists():
         raise argparse.ArgumentError(None, f"Path not found: {resolved}")
+    return resolved
+
+
+def resolve_existing_dir(path: str) -> str:
+    """Resolve *path* and verify it is an existing directory."""
+    resolved = resolve_existing_path(path)
+    if not Path(resolved).is_dir():
+        raise argparse.ArgumentError(None, f"Not a directory: {resolved}")
     return resolved
 
 
@@ -922,17 +1007,21 @@ def new_video_gen_arg_parser(
         metavar="ARG",
         default=[],
         help=(
-            "Image conditioning input: PATH FRAME_IDX STRENGTH [CRF]. "
+            "Image conditioning: PATH FRAME_IDX STRENGTH [BINDING] [CRF]. "
             "PATH is a still file — PNG/JPEG (SDR) or scene-linear .exr (HDR). "
-            "FRAME_IDX is the target frame index, STRENGTH is the conditioning strength "
-            "(all three required). "
-            "CRF is the optional H.264 compression quality for SDR stills (0=lossless); when "
-            "omitted, the value matching the checkpoint's model version is used. "
-            "Can be specified multiple times. Example: --image path/to/image1.jpg 0 0.8 "
-            "--image path/to/plate.exr 0 1.0 --hdr SRGB_LINEAR"
+            "BINDING is auto (default when omitted), replace, or guide. With auto, FRAME_IDX 0 "
+            "replaces the latent and later indices guide as keyframes. replace pins a still on a "
+            f"causal latent start (0 or 1 + {VIDEO_SCALE_FACTORS.time} * k pixel frames). guide adds "
+            "a keyframe at any pixel frame. When only one trailing token is given, a binding keyword "
+            "selects BINDING and an integer selects CRF. STRENGTH is the conditioning strength. CRF "
+            "optionally sets H.264 compression quality for SDR stills (0=lossless); when omitted, "
+            "the checkpoint's default is used. Examples: --image path/to/start.jpg 0 1.0  or  "
+            "--image path/to/end.jpg 160 1.0 guide  or  --image path/to/middle.jpg 65 1.0 replace  or  "
+            "--image path/to/start.jpg 0 1.0 7  or  --image path/to/plate.exr 0 1.0 --hdr SRGB_LINEAR."
         ),
     )
     add_hdr_args(parser)
+    add_marker_root_args(parser)
     return parser
 
 
@@ -1069,6 +1158,7 @@ def video_editing_arg_parser(
     parser.add_argument("--start-time", type=float, required=True, help="Start time of the region to regenerate (s).")
     parser.add_argument("--end-time", type=float, required=True, help="End time of the region to regenerate (s).")
     add_hdr_args(parser)
+    add_marker_root_args(parser)
     return parser
 
 
@@ -1183,6 +1273,7 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
             "ignored with --no-keyframes). Default: 0.95."
         ),
     )
+    add_marker_root_args(parser)
     return parser
 
 
@@ -1233,6 +1324,7 @@ def dubit_arg_parser(
         default=1.0,
         help="Strength for IC-LoRA video reference conditioning (default: 1.0).",
     )
+    add_marker_root_args(parser)
     return parser
 
 
@@ -1426,6 +1518,7 @@ def default_1_stage_t2a_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> a
         default=audio_guider.skip_step,
         help=f"Audio skip step (default: {audio_guider.skip_step}).",
     )
+    add_marker_root_args(parser)
     return parser
 
 

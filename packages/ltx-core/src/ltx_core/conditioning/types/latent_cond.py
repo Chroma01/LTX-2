@@ -83,5 +83,5 @@ def _apply_condition_by_latent_index(
 
     latent_state = latent_state.clone()
     latent_state.clean_latent[:, start_token:stop_token] = tokens
-    latent_state.denoise_mask[:, start_token:stop_token] = 1.0 - strength
+    latent_state.denoise_mask.tensor[:, start_token:stop_token] = 1.0 - strength
     return latent_state

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator, Sequence
 from multiprocessing import SimpleQueue
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -37,7 +38,9 @@ from ltx_pipelines.multigpu.tdp_builder import TiledDataParallelBuilder
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
 from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
+from ltx_pipelines.utils.args import markers_from_args
 from ltx_pipelines.utils.constants import TDP_DISTILLED_SIGMAS
+from ltx_pipelines.utils.helpers import get_device
 from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
@@ -181,10 +184,16 @@ class TI2VidTwoStagesHQRunner(MGPURunner):
         hdr: EXRColorSpace | None = None,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
+        marker_root_path: str | None = None,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
         # catches that and turns it into a recoverable RunnerError. Anything else is fatal.
         hdr = resolve_hdr_color_space(images=images or [], hdr=hdr)
+        video_marker, audio_marker = markers_from_args(
+            SimpleNamespace(marker_root_path=marker_root_path),
+            device=get_device(),
+            color_space=hdr,
+        )
         vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
         result = self._pipeline(
             prompt=prompt,
@@ -217,12 +226,18 @@ class TI2VidTwoStagesHQRunner(MGPURunner):
             output_path=output_path,
             video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
             color_space=hdr,
+            video_marker=video_marker,
+            audio_marker=audio_marker,
         )
         yield output_path
 
 
 if __name__ == "__main__":
-    from ltx_pipelines.utils.args import add_generated_keyframes_arg, add_keyframe_decode_arg, hq_2_stage_arg_parser
+    from ltx_pipelines.utils.args import (
+        add_generated_keyframes_arg,
+        add_keyframe_decode_arg,
+        hq_2_stage_arg_parser,
+    )
     from ltx_pipelines.utils.constants import LTX_2_3_HQ_PARAMS
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -277,6 +292,7 @@ if __name__ == "__main__":
             hdr=args.hdr,
             generated_keyframes=args.num_generated_keyframes,
             decode_with_keyframes=args.decode_with_keyframes,
+            marker_root_path=args.marker_root_path,
         ):
             pass  # drive the job to completion; the runner writes the file as a side effect
     finally:

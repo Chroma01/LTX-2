@@ -13,12 +13,11 @@ from ltx_pipelines.utils.helpers import (
     assert_resolution,
     assert_stage_supports_generated_keyframes,
     cleanup_memory,
-    combined_image_conditionings,
     decode_keyframes_from_slots,
     evenly_spaced_keyframe_positions,
     generated_keyframe_conditionings,
     get_device,
-    image_conditionings_by_adding_guiding_latent,
+    image_conditionings,
     resolve_generated_keyframes,
 )
 from ltx_pipelines.utils.samplers import (
@@ -58,7 +57,6 @@ __all__ = [
     "assert_resolution",
     "assert_stage_supports_generated_keyframes",
     "cleanup_memory",
-    "combined_image_conditionings",
     "decode_keyframes_from_slots",
     "euler_ancestral_denoising_loop",
     "euler_cfg_pp_denoising_loop",
@@ -67,7 +65,7 @@ __all__ = [
     "generated_keyframe_conditionings",
     "get_device",
     "gradient_estimating_euler_denoising_loop",
-    "image_conditionings_by_adding_guiding_latent",
+    "image_conditionings",
     "res2s_audio_video_denoising_loop",
     "resolve_generated_keyframes",
 ]

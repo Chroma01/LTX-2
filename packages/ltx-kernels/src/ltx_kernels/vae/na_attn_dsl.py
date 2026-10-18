@@ -26,6 +26,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.utils import SmemAllocator
 
+from ltx_kernels.devices import upload_from_host
 from ltx_kernels.vae.aot import KERNEL_CACHE, fake_dynamic_matrix, fake_dynamic_vector
 from ltx_kernels.vae.availability import UNSUPPORTED_MESSAGE, gpu_supports_dsl_kernels
 from ltx_kernels.vae.fna_attn_core import (
@@ -179,6 +180,8 @@ def _na_kernel(
     pool = smem.allocate_tensor(IO, cute.make_layout((pool_elems,)), byte_alignment=128)
     sO = _alias(pool, o_layout)
     sP = _alias(pool, p_layout)
+    # This warpgroup's chunk of ``sP`` at stage 0, for ``attention_tile``'s P fill.
+    sP_own = _alias(pool, p_layout, wg * (M * TILE_K))
     sK = _alias(pool, k_layout, 2 * M * TILE_K)
     sV = _alias(pool, v_layout, 4 * M * TILE_K)
     sQ = smem.allocate_tensor(IO, q_layout.outer, byte_alignment=128, swizzle=q_layout.inner)
@@ -323,7 +326,7 @@ def _na_kernel(
             if deep:
                 attention_tile(
                     (frQ, frK, frP, frV),
-                    (sK, sV, sP),
+                    (sK, sV, sP_own),
                     acc_qk,
                     acc_o,
                     (qkbar, pvbar),
@@ -390,7 +393,7 @@ def _na_kernel(
                         v_src = select_tensor(video_kv != 0, v, v_kf)
                     attention_tile(
                         (frQ, frK, frP, frV),
-                        (sK, sV, sP),
+                        (sK, sV, sP_own),
                         acc_qk,
                         acc_o,
                         (qkbar, pvbar),
@@ -422,7 +425,7 @@ def _na_kernel(
                     pass_i += 1
 
             cute.arch.sync_threads()
-            attn_epilogue(acc_o, l_sm, oreg, sO, lane, wg, HG)
+            attn_epilogue(acc_o, l_sm, oreg, pool, o_layout, lane, wg, HG)
             cute.arch.sync_threads()
             _scatter_a(sO, y_dst, rowix_w, copy_slot, HG * HD, c_off)
             cute.arch.sync_threads()
@@ -743,9 +746,9 @@ def _keyframe_operands(
         enabled=True,
         k=_dyn_act(rows(k_keyframes)),
         v=_dyn_act(rows(v_keyframes)),
-        slots=_dyn(slots_cpu.reshape(-1).to(device=device)),
-        planes=_dyn(planes.reshape(-1).to(device=device)),
-        counts=_dyn(counts.to(device=device)),
+        slots=_dyn(upload_from_host(slots_cpu.reshape(-1).contiguous(), device)),
+        planes=_dyn(upload_from_host(planes.reshape(-1).contiguous(), device)),
+        counts=_dyn(upload_from_host(counts, device)),
     )
 
 
@@ -844,8 +847,8 @@ def run_na_attention_bound(
         y_kf_buf = torch.empty((n_kf * H * W + M, NH * hd), device=q_.device, dtype=torch.bfloat16)
         y_kf_dyn = _dyn_act(y_kf_buf)
         q_kf_ = _dyn_act(q_kf_rows)
-        kfv = _dyn(video_frames.reshape(-1).to(device=q_.device))
-        kfv_counts = _dyn((video_frames >= 0).sum(dim=-1).to(dtype=torch.int32, device=q_.device))
+        kfv = _dyn(upload_from_host(video_frames.reshape(-1).contiguous(), q_.device))
+        kfv_counts = _dyn(upload_from_host((video_frames >= 0).sum(dim=-1).to(dtype=torch.int32), q_.device))
         n_kfq_tiles = n_kf * grid_h * grid_w
     else:
         _, _, q_kf_, y_kf_dyn = _inert_operands(hd, NH * hd, q_.device)

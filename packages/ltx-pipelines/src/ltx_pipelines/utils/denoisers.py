@@ -47,7 +47,7 @@ def _repeat_state(state: LatentState, n: int) -> LatentState:
 
     return LatentState(
         latent=_repeat(state.latent),
-        denoise_mask=_repeat(state.denoise_mask),
+        denoise_mask=state.denoise_mask.with_same_values(_repeat(state.denoise_mask.tensor)),
         positions=_repeat(state.positions),
         clean_latent=_repeat(state.clean_latent),
         attention_mask=_repeat(state.attention_mask) if state.attention_mask is not None else None,

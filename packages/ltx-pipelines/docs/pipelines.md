@@ -6,15 +6,22 @@ Full reference for each pipeline. See the [Pipeline Selection Guide](pipeline-se
 
 ## 1. TI2VidTwoStagesPipeline
 
-**Best for:** Guided two-stage text/image-to-video with CFG/STG and 2x upsampling.
+**Best for:** Guided two-stage text/image-to-video and keyframe interpolation with CFG/STG and 2x upsampling.
 
 **Source**: [`src/ltx_pipelines/ti2vid_two_stages.py`](../src/ltx_pipelines/ti2vid_two_stages.py)
 
-Two-stage generation: Stage 1 generates low-resolution video with [multimodal guidance](multimodal-guidance.md), Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning. Slower than DistilledPipeline; for production quality use [`DFRPipeline`](#12-dfrpipeline).
+Two-stage generation: Stage 1 generates low-resolution video with [multimodal guidance](multimodal-guidance.md),
+Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning, including
+[keyframe interpolation](#6-keyframe-interpolation) through explicit keyframe-guide bindings. Slower than
+DistilledPipeline; for production quality use [`DFRPipeline`](#12-dfrpipeline).
 
-**Extra CLI arguments:** `--chunk-pixel-frames` (default 97) and/or `--chunk-carry-frames` (default 25) enable long-video windowing; `--chunk-blend-frames` controls the decoded seam crossfade (default: full carry, `0` for a hard cut). Also on `ltx_pipelines.ti2vid_two_stages_mgpu`.
+**Extra CLI arguments:** `--chunk-pixel-frames` (default 97) and/or `--chunk-carry-frames` (default 25) enable
+long-video windowing; `--chunk-blend-frames` controls the decoded seam crossfade (default: full carry, `0` for a hard cut).
+`--refine-audio` denoises audio again in stage 2 instead of preserving stage-1 audio. These flags are also available on
+`ltx_pipelines.ti2vid_two_stages_mgpu`.
 
-**Use when:** You want CFG/STG-guided two-stage text/image-to-video, not the DFR detailing path.
+**Use when:** You want CFG/STG-guided two-stage text/image-to-video or keyframe interpolation, not the DFR detailing
+path.
 
 ---
 
@@ -115,13 +122,19 @@ python -m ltx_pipelines.ic_lora \
 
 ---
 
-## 6. KeyframeInterpolationPipeline
+## 6. Keyframe interpolation
 
 **Best for:** Generating videos by interpolating between keyframe images.
 
-**Source**: [`src/ltx_pipelines/keyframe_interpolation.py`](../src/ltx_pipelines/keyframe_interpolation.py)
+Use [`TI2VidTwoStagesPipeline`](#1-ti2vidtwostagespipeline) with explicit keyframe-guide image bindings. In Python,
+construct each image with `ImageConditioningInput.guide(path, frame_idx, strength)`, where `frame_idx` is a
+zero-based pixel-frame index on the decoded output timeline; on the CLI, pass each image as
+`--image PATH FRAME_IDX STRENGTH guide [CRF]` and add `--refine-audio`. The CLI index uses the same pixel-frame
+unit.
 
-Two-stage generation with keyframe interpolation. Uses guiding latents (additive conditioning) instead of replacing latents for smoother transitions. [Multimodal guidance](multimodal-guidance.md) in stage 1, upsampling in stage 2.
+The two-stage pipeline uses guiding latents (additive conditioning) for these inputs, with
+[multimodal guidance](multimodal-guidance.md) in stage 1 and upsampling in stage 2. Pass `refine_audio=True` to
+also refine audio in stage 2, preserving the former keyframe-interpolation behavior.
 
 **Use when:** You have keyframe images and want to interpolate between them, creating smooth transitions, or animation/motion interpolation tasks.
 

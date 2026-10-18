@@ -43,6 +43,7 @@ from ltx_pipelines.utils.args import (
     add_keyframe_decode_arg,
     chunk_config_from_args,
     default_2_stage_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -74,6 +75,7 @@ from ltx_pipelines.utils.types import (
     DEFAULT_AUTO_DURATION,
     AutoDuration,
     ImageConditioningInput,
+    LoadedImageConditioning,
     OffloadMode,
     PipelineOutput,
     VideoAudio,
@@ -90,8 +92,8 @@ class _TI2VidRunContext:
     noiser: GaussianNoiser
     dtype: torch.dtype
     vae_dtype: torch.dtype
-    #: ``images`` with every unset CRF filled in, so callers do not re-resolve it.
-    images: list[ImageConditioningInput]
+    #: ``images`` loaded once for the run (CRF resolved, stills decoded), so callers do not reload them.
+    images: list[LoadedImageConditioning]
     v_context_p: torch.Tensor
     a_context_p: torch.Tensor
     v_context_n: torch.Tensor
@@ -211,6 +213,7 @@ class TI2VidTwoStagesPipeline:
         width: int,
         frame_rate: float,
         images: list[ImageConditioningInput],
+        color_space: EXRColorSpace | None,
         num_frames: int | AutoDuration,
         vae_dtype: torch.dtype | None,
         tiling_config: TilingConfig | AutoTiling | None,
@@ -222,7 +225,8 @@ class TI2VidTwoStagesPipeline:
     ) -> _TI2VidRunContext:
         """Validate inputs, encode prompts, and resolve frame count / tiling before chunk planning."""
         require_num_frames_source(num_frames, self.duration_predictor)
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=True)
         assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage_1)
 
@@ -235,7 +239,7 @@ class TI2VidTwoStagesPipeline:
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -289,9 +293,8 @@ class TI2VidTwoStagesPipeline:
 
     def _video_conditionings(
         self,
-        images: list[ImageConditioningInput],
+        images: list[LoadedImageConditioning],
         num_frames: int,
-        color_space: EXRColorSpace | None,
     ) -> MakeVideoConditionings:
         assert_image_frames_in_clip(images, num_frames)
 
@@ -303,7 +306,6 @@ class TI2VidTwoStagesPipeline:
                     chunk,
                     images=images,
                     video_encoder=enc,
-                    color_space=color_space,
                 )
             )
 
@@ -333,9 +335,11 @@ class TI2VidTwoStagesPipeline:
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
+        refine_audio: bool = False,
     ) -> PipelineOutput:
         """Generate a video.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
+        Set ``refine_audio=True`` to denoise audio in stage 2; by default stage-1 audio is preserved.
         """
         chunks, num_frames, tiling_config = self.stream_chunks(
             prompt=prompt,
@@ -360,6 +364,7 @@ class TI2VidTwoStagesPipeline:
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
             chunk_config=chunk_config,
+            refine_audio=refine_audio,
         )
         return pipeline_output_from_chunks(chunks, num_frames=num_frames, tiling_config=tiling_config)
 
@@ -387,9 +392,11 @@ class TI2VidTwoStagesPipeline:
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
+        refine_audio: bool = False,
     ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
         """Generate a video as a stream of decoded chunks.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
+        Set ``refine_audio=True`` to denoise audio in stage 2; by default stage-1 audio is preserved.
         """
         ctx = self._prepare_run(
             prompt=prompt,
@@ -399,6 +406,7 @@ class TI2VidTwoStagesPipeline:
             width=width,
             frame_rate=frame_rate,
             images=images,
+            color_space=color_space,
             num_frames=num_frames,
             vae_dtype=vae_dtype,
             tiling_config=tiling_config,
@@ -440,7 +448,7 @@ class TI2VidTwoStagesPipeline:
             dtype=ctx.dtype,
             config=ctx.chunk_config,
             video_scale_factors=self.stage_1.video_scale_factors,
-            make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames, color_space),
+            make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames),
             generated_keyframes=generated_keyframes,
         )
         base = denoise_chunks(
@@ -459,7 +467,7 @@ class TI2VidTwoStagesPipeline:
             sigmas=stage_2_sigmas,
             noiser=ctx.noiser,
             fps=frame_rate,
-            freeze_audio=True,
+            freeze_audio=not refine_audio,
         )
         return (
             decode_chunks(
@@ -486,7 +494,14 @@ def main() -> None:
             add_generated_keyframes_arg(default_2_stage_arg_parser(params=params, supports_auto_duration=True))
         )
     )
+    parser.add_argument(
+        "--refine-audio",
+        action="store_true",
+        help="Denoise audio in stage 2 instead of preserving the stage-1 audio.",
+    )
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
     pipeline = TI2VidTwoStagesPipeline(
         model_paths=args.model_paths,
         distilled_lora=args.distilled_lora,
@@ -498,7 +513,6 @@ def main() -> None:
         prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         diffvae_optimization=args.diffvae_optimization,
     )
-    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     chunk_config = chunk_config_from_args(args)
     video_guider_params = MultiModalGuiderParams(
@@ -538,6 +552,7 @@ def main() -> None:
         generated_keyframes=args.num_generated_keyframes,
         decode_with_keyframes=args.decode_with_keyframes,
         chunk_config=chunk_config,
+        refine_audio=args.refine_audio,
     )
     if chunk_config is not None:
         video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
@@ -558,6 +573,8 @@ def main() -> None:
         video_chunks_number=video_chunks_number,
         color_space=hdr,
         audio_sampling_rate=audio_sampling_rate,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

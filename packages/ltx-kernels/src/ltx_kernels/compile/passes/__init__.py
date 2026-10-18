@@ -8,11 +8,13 @@ from ltx_kernels.compile.passes.fuse_trailing_quantize import (
     AdaZeroTrailingQuantizePass,
     GatedAttentionTrailingQuantizePass,
 )
+from ltx_kernels.compile.passes.fused_send_recv import CoalescedExchangeBarrierPass, FusedSendRecvPass
 from ltx_kernels.compile.passes.gated_attention import GatedAttentionPass
 from ltx_kernels.compile.passes.grouped_upcast import GroupedUpcastPass
 from ltx_kernels.compile.passes.linear_gelu import LinearGELUPass
 from ltx_kernels.compile.passes.pre_attention import PreAttentionPass
 from ltx_kernels.compile.passes.rms_fma import RMSFmaAdaLNPass, RMSFmaPass
+from ltx_kernels.compile.passes.sdpa_select import SDPASelectPass
 
 
 def inductor_passes() -> list[PassBase]:
@@ -22,8 +24,10 @@ def inductor_passes() -> list[PassBase]:
     adds cost more there than they save, alone and together, by cutting inductor's own
     fusion across the block. The quantize passes are inert unless
     ``ltx_core.quantization.blockwise`` installs the linears that emit
-    ``ltx_kernels::blockwise_quantize``. :class:`GroupedUpcastPass` is inert outside the
-    fp8-cast policy.
+    ``ltx_kernels::blockwise_quantize``. :class:`FusedSendRecvPass` is inert outside
+    sequence parallelism and binds the op :class:`PreAttentionPass` leaves behind;
+    :class:`CoalescedExchangeBarrierPass` then gives the exchanges it fuses one barrier per attention.
+    :class:`GroupedUpcastPass` is inert outside the fp8-cast policy.
     One instance per stream shape (LTX-2.3: video 4096, audio 2048), since a pass pins
     the ``hidden_dim`` and ``heads`` literals its pattern carries.
     """
@@ -32,11 +36,14 @@ def inductor_passes() -> list[PassBase]:
         PreAttentionPass(hidden_dim=2048, heads=32, eps=1e-6),
         GatedAttentionPass(),
         LinearGELUPass(),
+        FusedSendRecvPass(),
+        CoalescedExchangeBarrierPass(),
         BlockwiseQuantizeCSE(),
         AdaZeroTrailingQuantizePass(hidden_dim=4096, eps=1e-6),
         AdaZeroTrailingQuantizePass(hidden_dim=2048, eps=1e-6),
         GatedAttentionTrailingQuantizePass(),
         GroupedUpcastPass(),
+        SDPASelectPass(),
     ]
 
 
@@ -64,6 +71,8 @@ __all__ = [
     "AdaZeroPass",
     "AdaZeroTrailingQuantizePass",
     "BlockwiseQuantizeCSE",
+    "CoalescedExchangeBarrierPass",
+    "FusedSendRecvPass",
     "GatedAttentionPass",
     "GatedAttentionTrailingQuantizePass",
     "GroupedUpcastPass",
@@ -71,6 +80,7 @@ __all__ = [
     "PreAttentionPass",
     "RMSFmaAdaLNPass",
     "RMSFmaPass",
+    "SDPASelectPass",
     "eager_passes",
     "inductor_passes",
 ]

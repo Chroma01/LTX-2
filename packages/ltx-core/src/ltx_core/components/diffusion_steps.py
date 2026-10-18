@@ -150,8 +150,7 @@ class Res2sDiffusionStep(DiffusionStepProtocol):
 
         sigma_up = torch.nan_to_num(sigma_up if sigma_up is not None else torch.zeros_like(sigma_next), 0.0)
         # Replace NaNs in sigma_down with corresponding sigma_next elements (float32)
-        nan_mask = torch.isnan(sigma_down)
-        sigma_down[nan_mask] = sigma_next[nan_mask].to(sigma_down.dtype)
+        sigma_down = torch.where(torch.isnan(sigma_down), sigma_next.to(sigma_down.dtype), sigma_down)
         alpha_ratio = torch.nan_to_num(alpha_ratio, 1.0)
 
         return alpha_ratio, sigma_down, sigma_up
@@ -180,8 +179,7 @@ class Res2sDiffusionStep(DiffusionStepProtocol):
         sigma_next = sigmas[step_index + 1]
         alpha_ratio, sigma_down, sigma_up = self.get_sde_coeff(sigma_next, sigma_up=sigma_next * eta)
         output_dtype = denoised_sample.dtype
-        if torch.any(sigma_up == 0) or torch.any(sigma_next == 0):
-            return denoised_sample
+        return_denoised = torch.any(sigma_up == 0) | torch.any(sigma_next == 0)
 
         # Extract epsilon prediction
         eps_next = (sample - denoised_sample) / (sigma - sigma_next)
@@ -189,7 +187,7 @@ class Res2sDiffusionStep(DiffusionStepProtocol):
 
         # Mix deterministic and stochastic components
         x_noised = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise
-        return x_noised.to(output_dtype)
+        return torch.where(return_denoised, denoised_sample, x_noised.to(output_dtype))
 
 
 class EulerCfgPpDiffusionStep(DiffusionStepProtocol):

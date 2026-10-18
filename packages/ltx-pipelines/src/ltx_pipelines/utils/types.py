@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Generic, NamedTuple, Protocol, TypeVar
 
 import torch
 
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
-from ltx_core.conditioning import ConditioningItem
+from ltx_core.conditioning import (
+    ConditioningItem,
+    VideoConditionByKeyframeIndex,
+    VideoConditionByLatentIndex,
+)
 from ltx_core.model.transformer import X0Model
 from ltx_core.model.video_vae import TilingConfig
-from ltx_core.types import Audio, LatentState
+from ltx_core.types import Audio, LatentState, SpatioTemporalScaleFactors
 from ltx_pipelines.utils.constants import VIDEO_LATENT_CHANNELS, VIDEO_SCALE_FACTORS
 
 _T = TypeVar("_T")
@@ -32,18 +36,152 @@ class PipelineOutput(NamedTuple):
     tiling_config: TilingConfig | None
 
 
-class ImageConditioningInput(NamedTuple):
-    """An image to condition on, with the H.264 CRF it should be re-compressed at.
-    Leaving ``crf`` unset means "use whatever matches the model": the pipeline fills it in
-    from the checkpoint it runs (``ImageConditioner.resolve_crf``), since the value the model
-    was trained with is a property of the model generation. Pass ``crf`` explicitly to
-    override it, including ``0`` to skip re-compression entirely.
+@dataclass(frozen=True)
+class ImageReplace:
+    """Pin a still by replacing the latent that starts at a pixel-frame index.
+    ``frame_idx`` is zero-based on the decoded video timeline, not a latent index. Because the
+    video VAE is causal, valid values are frame 0 and the first pixel frame of each later latent:
+    ``1 + VIDEO_SCALE_FACTORS.time * k`` (1, 9, 17, ... for the default temporal scale of 8).
+    """
+
+    frame_idx: int
+
+    def __post_init__(self) -> None:
+        _assert_replacement_frame_idx(self.frame_idx)
+
+
+@dataclass(frozen=True)
+class ImageGuide:
+    """Guide the clip with a keyframe at a zero-based decoded pixel-frame index."""
+
+    frame_idx: int
+
+
+ImageBinding = ImageReplace | ImageGuide
+
+
+@dataclass(frozen=True)
+class ImageConditioningInput:
+    """A still to condition on, by file, with the H.264 CRF it should be re-compressed at.
+    All frame indices are zero-based pixel-frame indices. Leaving ``crf`` unset uses the model's
+    checkpoint default; pass it explicitly to override that value, including ``0`` to skip
+    re-compression.
+    How the still binds is ``binding``: :class:`ImageReplace` or :class:`ImageGuide`.
+    Construct with :meth:`at` (frame 0 replaces, later frames guide), :meth:`replace`, or
+    :meth:`guide`. Pipelines load it with
+    :meth:`~ltx_pipelines.utils.blocks.ImageConditioner.load_conditionings` into a
+    :class:`LoadedImageConditioning` before encoding.
     """
 
     path: str
-    frame_idx: int
     strength: float
+    binding: ImageBinding
     crf: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, (ImageReplace, ImageGuide)):
+            raise TypeError(f"binding must be ImageReplace or ImageGuide, got {type(self.binding).__name__}")
+
+    @classmethod
+    def at(
+        cls,
+        path: str,
+        frame_idx: int,
+        strength: float,
+        crf: int | None = None,
+    ) -> ImageConditioningInput:
+        """Bind at a pixel frame, replacing frame 0 and guiding at every later frame."""
+        if frame_idx == 0:
+            return cls.replace(path, 0, strength, crf)
+        else:
+            return cls.guide(path, frame_idx, strength, crf)
+
+    @classmethod
+    def replace(
+        cls,
+        path: str,
+        frame_idx: int,
+        strength: float,
+        crf: int | None = None,
+    ) -> ImageConditioningInput:
+        """Replace at a zero-based pixel frame that starts a causal VAE latent."""
+        return cls(path=path, strength=strength, binding=ImageReplace(frame_idx), crf=crf)
+
+    @classmethod
+    def guide(
+        cls,
+        path: str,
+        frame_idx: int,
+        strength: float,
+        crf: int | None = None,
+    ) -> ImageConditioningInput:
+        """Guide generation with a still at a pixel-frame index."""
+        return cls(path=path, strength=strength, binding=ImageGuide(frame_idx), crf=crf)
+
+
+class DecodedStill(Protocol):
+    """A conditioning still decoded once for a run, cut to each resolution it is encoded at."""
+
+    def tensor(self, height: int, width: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """The still resized and cropped to ``height`` x ``width``, as a ``(1, C, 1, H, W)`` VAE input."""
+        ...
+
+
+@dataclass(frozen=True)
+class LoadedImageConditioning:
+    """A decoded still bound to the clip: what a run encodes as an image conditioning.
+    Built by :meth:`~ltx_pipelines.utils.blocks.ImageConditioner.load_conditionings` from an
+    :class:`ImageConditioningInput`. Rebasing it onto a stage, tile, window or chunk timeline
+    (:meth:`map_frame_index`) keeps ``still``, so the file is decoded once per run.
+    """
+
+    still: DecodedStill
+    strength: float
+    binding: ImageBinding
+
+    @property
+    def frame_idx(self) -> int:
+        """Pixel-frame index carried by either supported image binding."""
+        match self.binding:
+            case ImageReplace(frame_idx):
+                return frame_idx
+            case ImageGuide(frame_idx):
+                return frame_idx
+        raise TypeError(f"unhandled image binding: {self.binding!r}")
+
+    def assert_in_clip(self, num_frames: int) -> None:
+        """Raise when this conditioning's pixel-frame index lies outside the planned stitched clip."""
+        if self.frame_idx < 0 or self.frame_idx >= num_frames:
+            raise ValueError(f"frame_idx={self.frame_idx} is outside the planned stitched range [0, {num_frames})")
+
+    def map_frame_index(self, mapper: Callable[[int], int | None]) -> LoadedImageConditioning | None:
+        """Map the pixel-frame index through ``mapper``, preserving replace vs guide binding and the still."""
+        local = mapper(self.frame_idx)
+        if local is None:
+            return None
+        match self.binding:
+            case ImageReplace():
+                return replace(self, binding=ImageReplace(local))
+            case ImageGuide():
+                return replace(self, binding=ImageGuide(local))
+        raise TypeError(f"unhandled image binding: {self.binding!r}")
+
+    def to_item(self, encoded: torch.Tensor) -> ConditioningItem:
+        """Lower to a core item, converting a replacement's pixel frame to a latent index."""
+        match self.binding:
+            case ImageReplace(frame_idx):
+                return VideoConditionByLatentIndex(
+                    latent=encoded,
+                    strength=self.strength,
+                    latent_idx=_replacement_frame_to_latent_index(frame_idx),
+                )
+            case ImageGuide(frame_idx):
+                return VideoConditionByKeyframeIndex(
+                    keyframes=encoded,
+                    strength=self.strength,
+                    frame_idx=frame_idx,
+                )
+        raise TypeError(f"unhandled image binding: {self.binding!r}")
 
 
 class PipelineComponents:
@@ -201,3 +339,24 @@ class OffloadMode(Enum):
     NONE = "none"
     CPU = "cpu"
     DISK = "disk"
+
+
+def _assert_replacement_frame_idx(
+    frame_idx: int,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+) -> None:
+    if frame_idx == 0:
+        return
+    temporal_scale = scale_factors.time
+    if frame_idx < 1 or (frame_idx - 1) % temporal_scale != 0:
+        raise ValueError(f"ImageReplace frame_idx must be 0 or 1 + {temporal_scale} * k, got {frame_idx}")
+
+
+def _replacement_frame_to_latent_index(
+    frame_idx: int,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+) -> int:
+    if frame_idx == 0:
+        return 0
+    temporal_scale = scale_factors.time
+    return 1 + (frame_idx - 1) // temporal_scale

@@ -22,6 +22,7 @@ from ltx_pipelines.utils.args import (
     add_generated_keyframes_arg,
     add_keyframe_decode_arg,
     default_1_stage_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -38,12 +39,12 @@ from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_generated_keyframes_request,
     assert_resolution,
-    combined_image_conditionings,
     create_initial_av_latents,
     decode_keyframes_from_slots,
     ensure_tiling_config,
     generated_keyframe_conditionings,
     get_device,
+    image_conditionings,
     resolve_generated_keyframes,
     tiling_scale_factors_for_vae,
 )
@@ -164,7 +165,8 @@ class TI2VidOneStagePipeline:
         decode_with_keyframes: bool = False,
     ) -> PipelineOutput:
         require_num_frames_source(num_frames, self.duration_predictor)
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=False)
         assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage)
 
@@ -178,7 +180,7 @@ class TI2VidOneStagePipeline:
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -203,14 +205,13 @@ class TI2VidOneStagePipeline:
         )
 
         stage_1_conditionings = self.image_conditioner(
-            lambda enc: combined_image_conditionings(
+            lambda enc: image_conditionings(
                 images=images,
                 height=height,
                 width=width,
                 video_encoder=enc,
                 dtype=dtype,
                 device=self.device,
-                color_space=color_space,
             )
         )
         stage_1_conditionings.extend(generated_keyframe_conditionings(generated_keyframes, num_frames))
@@ -292,6 +293,8 @@ def main() -> None:
         add_generated_keyframes_arg(default_1_stage_arg_parser(params=params, supports_auto_duration=True))
     )
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
     pipeline = TI2VidOneStagePipeline(
         model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
@@ -301,7 +304,6 @@ def main() -> None:
         prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         diffvae_optimization=args.diffvae_optimization,
     )
-    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     result = pipeline(
         prompt=args.prompt,
@@ -346,6 +348,8 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

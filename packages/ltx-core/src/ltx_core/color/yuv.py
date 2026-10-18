@@ -8,9 +8,12 @@ I420 / planar packing stay here (not provided by colour).
 from __future__ import annotations
 
 import enum
+import functools
 
 import colour
 import torch
+
+from ltx_core.devices import upload_from_host
 
 
 class ColorSpace(enum.Enum):
@@ -82,6 +85,13 @@ def _rgb_to_ycbcr_matrix(weights_name: str) -> torch.Tensor:
 # Built once; ``ColorSpace.rgb_to_ycbcr_matrix`` reads from here.
 _RGB_TO_YCBCR = {cs: _rgb_to_ycbcr_matrix(cs._weights_name) for cs in ColorSpace}
 
+
+@functools.lru_cache(maxsize=16)
+def _device_rgb_to_ycbcr_matrix(color_space: ColorSpace, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``color_space``'s matrix on ``device`` in ``dtype``, uploaded once without waiting for the device."""
+    return upload_from_host(color_space.rgb_to_ycbcr_matrix.to(dtype=dtype), device)
+
+
 # cuBLAS GEMM dims are int32. PyTorch folds ``(F, H*W, 3) @ (3, 3)`` into one
 # ``mm`` of size ``F*H*W``, reported as ``n`` in column-major. ``n`` must be
 # strictly less than this value (see ``at::cuda::blas::gemm``).
@@ -121,7 +131,7 @@ def rgb_to_yuv(image: torch.Tensor, color_space: ColorSpace) -> torch.Tensor:
     are concatenated. (``colour.RGB_to_YCbCr`` is NumPy-only and not used here.)
     """
     _require_rgb_chw(image)
-    mat = color_space.rgb_to_ycbcr_matrix.to(device=image.device, dtype=image.dtype)
+    mat = _device_rgb_to_ycbcr_matrix(color_space, image.device, image.dtype)
     orig_shape = image.shape
     height, width = orig_shape[-2], orig_shape[-1]
     frames = image.reshape(-1, 3, height, width)

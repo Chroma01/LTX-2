@@ -234,6 +234,20 @@ public:
    */
   at::Tensor allgather(at::Tensor &x, bool copy_output);
 
+  /// Fused RMS-norm + split RoPE of ``x`` ``[b, s, h]``, written straight into every rank's buffer in the
+  /// ``send_recv_heads`` layout ``[b, world_size * s, h / world_size]``. With ``barrier``, returns once all
+  /// ranks' writes into the local buffer are visible; without it, a later exchange_barrier() does that.
+  void rope_send_recv_heads(at::Tensor &x, at::Tensor &sin_freqs, at::Tensor &cos_freqs, at::Tensor &weights,
+                            double eps, bool barrier);
+
+  /// ``x @ weight.T + bias`` with each rank's output columns written straight into that rank's buffer in
+  /// the ``send_recv_heads`` layout. ``barrier`` as for rope_send_recv_heads().
+  void linear_send_recv_heads(at::Tensor &x, at::Tensor &weight, at::Tensor &bias, bool barrier);
+
+  /// Returns once every rank's writes issued earlier on this stream -- into any instance's buffer --
+  /// are visible to every rank. Completes the exchanges run with ``barrier`` false.
+  void exchange_barrier();
+
   /**
    * @brief Sets the all2all barrier timeout in seconds.
    *

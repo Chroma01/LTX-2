@@ -19,6 +19,7 @@ from ltx_core.types import Audio, AudioLatentShape
 from ltx_pipelines.utils import get_device
 from ltx_pipelines.utils.args import (
     default_1_stage_t2a_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -179,6 +180,7 @@ def main() -> None:
     params = resolve_cli_params()
     parser = default_1_stage_t2a_arg_parser(params=params)
     args = parser.parse_args()
+    _, audio_marker = markers_from_args(args, device=get_device())
     pipeline = T2AOneStagePipeline(
         model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
@@ -209,7 +211,7 @@ def main() -> None:
         max_batch_size=args.max_batch_size,
     )
 
-    encode_audio(audio=audio, output_path=args.output_path)
+    encode_audio(audio=audio, output_path=args.output_path, audio_marker=audio_marker)
 
 
 if __name__ == "__main__":

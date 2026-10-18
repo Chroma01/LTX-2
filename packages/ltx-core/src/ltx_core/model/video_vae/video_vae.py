@@ -10,7 +10,7 @@ from ltx_core.model.common.normalization import PixelNorm
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
 from ltx_core.model.video_vae.attention import AttnBlock3D
-from ltx_core.model.video_vae.convolution import make_conv_nd
+from ltx_core.model.video_vae.convolution import make_conv_nd, memory_format_of
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
@@ -291,6 +291,9 @@ class VideoEncoder(nn.Module, Disposable):
         # This reduces H,W by patch_size and increases channels, making convolutions more efficient
         # Example: (B, 3, F, 512, 512) -> (B, 48, F, 128, 128) with patch_size=4
         sample = patchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+        # Activations follow the weights' layout: channels-last weights (CHANNELS_LAST_3D_WEIGHTS)
+        # keep the whole encoder on NHWC conv kernels.
+        sample = sample.contiguous(memory_format=memory_format_of(self.conv_in.weight))
         sample = self.conv_in(sample)
 
         for down_block in self.down_blocks:
@@ -335,7 +338,7 @@ class VideoEncoder(nn.Module, Disposable):
 
         # Split into means and logvar, then normalize means
         means, _ = torch.chunk(sample, 2, dim=1)
-        return self.per_channel_statistics.normalize(means)
+        return self.per_channel_statistics.normalize(means).contiguous()
 
     def tiled_encode(
         self,

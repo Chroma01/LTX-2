@@ -33,10 +33,10 @@ def _block_quantize_kernel(
     X,
     Out_scales,
     X_out,
+    tma_aligned_mn: int,
     H: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    TMA_ALIGNED_MN: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
@@ -48,7 +48,7 @@ def _block_quantize_kernel(
         X_out + token_idx * H + BLOCK_SIZE * tl.arange(0, NUM_BLOCKS)[:, None] + tl.arange(0, BLOCK_SIZE)[None, :]
     )
     tl.store(x_out_ptr, o_quant)
-    out_scales_ptr = Out_scales + token_idx + TMA_ALIGNED_MN * tl.arange(0, NUM_BLOCKS)[:, None]
+    out_scales_ptr = Out_scales + token_idx + tma_aligned_mn * tl.arange(0, NUM_BLOCKS)[:, None]
     tl.store(out_scales_ptr, o_scales)
 
 
@@ -65,7 +65,7 @@ def blockwise_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     num_rows = b * s
     num_blocks = h // _BLOCK_SIZE
     out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-    scales, tma_aligned_mn = _empty_tma_aligned_scales(num_rows, num_blocks, x.device)
+    scales = _empty_tma_aligned_scales(num_rows, num_blocks, x.device)
     wrap_triton(_block_quantize_kernel)[(num_rows,)](
         x,
         scales,
@@ -73,10 +73,10 @@ def blockwise_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         H=h,
         BLOCK_SIZE=_BLOCK_SIZE,
         NUM_BLOCKS=num_blocks,
-        TMA_ALIGNED_MN=tma_aligned_mn,
+        tma_aligned_mn=scales.shape[1],
         SCALE_MAX=_FP8_SCALE_MAX,
     )
-    return out.view(b, s, h), scales
+    return out.view(b, s, h), scales.t()[:num_rows]
 
 
 @jit

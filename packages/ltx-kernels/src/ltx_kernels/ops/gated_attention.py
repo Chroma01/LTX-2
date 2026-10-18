@@ -40,12 +40,12 @@ def _gated_attention_kernel(  # noqa: PLR0913
     gate_batch_stride: int,
     gate_token_stride: int,
     seqlen: int,
+    tma_aligned_mn: int,
     H: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     DIM_HEAD: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    TMA_ALIGNED_MN: tl.constexpr,
     QUANTIZE: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
@@ -74,7 +74,7 @@ def _gated_attention_kernel(  # noqa: PLR0913
             Out + token_idx * H + BLOCK_SIZE * tl.arange(0, NUM_BLOCKS)[:, None] + tl.arange(0, BLOCK_SIZE)[None, :]
         )
         tl.store(out_ptr, o_quant)
-        scales_ptr = Out_scales + token_idx + TMA_ALIGNED_MN * tl.arange(0, NUM_BLOCKS)[:, None]
+        scales_ptr = Out_scales + token_idx + tma_aligned_mn * tl.arange(0, NUM_BLOCKS)[:, None]
         tl.store(scales_ptr, o_scales)
     else:
         out_ptr = Out + token_idx * H + offsets
@@ -120,7 +120,7 @@ def gated_attention(x: torch.Tensor, gate_logits: torch.Tensor) -> torch.Tensor:
         DIM_HEAD=dim_head,
         NUM_BLOCKS=num_blocks,
         BLOCK_SIZE=_BLOCK_SIZE,
-        TMA_ALIGNED_MN=0,
+        tma_aligned_mn=0,
         QUANTIZE=False,
         SCALE_MAX=_FP8_SCALE_MAX,
     )
@@ -149,7 +149,7 @@ def gated_attention_quantized(x: torch.Tensor, gate_logits: torch.Tensor) -> Tup
     gate_logits = gate_logits.expand(b, t, num_heads)
 
     out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-    scales, tma_aligned_mn = _empty_tma_aligned_scales(num_rows, num_blocks, x.device)
+    scales = _empty_tma_aligned_scales(num_rows, num_blocks, x.device)
 
     wrap_triton(_gated_attention_kernel)[(num_rows,)](
         x,
@@ -164,9 +164,9 @@ def gated_attention_quantized(x: torch.Tensor, gate_logits: torch.Tensor) -> Tup
         DIM_HEAD=dim_head,
         NUM_BLOCKS=num_blocks,
         BLOCK_SIZE=_BLOCK_SIZE,
-        TMA_ALIGNED_MN=tma_aligned_mn,
+        tma_aligned_mn=scales.shape[1],
         QUANTIZE=True,
         SCALE_MAX=_FP8_SCALE_MAX,
     )
 
-    return out.view(b, t, h), scales
+    return out.view(b, t, h), scales.t()[:num_rows]

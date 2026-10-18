@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.5.0 - 2026-10-18
+
+### Added
+
+- `ImageConditioningInput` supports explicit latent-replacement and keyframe-guide bindings. On video CLIs, pass `--image PATH FRAME_IDX STRENGTH replace|guide [CRF]`; omit the binding keyword for the prior automatic binding (frame 0 replaces, later frames guide). Replacement frame indices are expressed in pixel space and must be `0` or a causal latent boundary (`1 + 8 * k`).
+- `TI2VidTwoStagesPipeline` supports keyframe interpolation through `ImageConditioningInput.guide()` bindings, or
+  `--image … guide` on the CLI. Set `refine_audio=True` or pass `--refine-audio` to preserve the former dedicated
+  pipeline's stage-2 audio refinement; the default preserves stage-1 audio.
+- `ImageConditioner.load_conditionings(images, color_space=None)` resolves each image conditioning's CRF (like `resolve_crf`), decodes each distinct still once (SDR, or EXR with `color_space`) and returns `LoadedImageConditioning`s: the decoded still plus the input's `binding` and `strength`.
+- `MGPUController(cpu_threads_per_rank=8)` caps each rank's intra-op CPU threads (`torch.set_num_threads`) so the ranks' small host tensor ops do not stall on many-core hosts. Pass `None` to keep torch's default.
+- `LTX_MGPU_DECODE_RECEIVER_TIMEOUT_SECONDS` sets how long a multi-GPU video decode waits for a rank that stopped streaming before it gives up (default 60).
+
+### Changed
+
+- Multi-GPU pipelines encode prompts faster with the default Accelerate-sharded Gemma: the other ranks now wait on the host until the source rank's Gemma has finished on every GPU, instead of spinning in an NCCL receive on a GPU Gemma is still using. `BroadcastCoordinator` moved from `ltx_pipelines.multigpu._broadcast` to `ltx_core.multigpu.broadcast`, and `BroadcastGemmaWrapper` (and so `AccelerateGemmaWrapper`) takes an optional `coordinator`. `BroadcastCoordinator.wait_for_signal_change` now consumes exactly one signal per call (a worker that polls late no longer skips a signal) and takes an optional `timeout`.
+- `ImageConditioningInput` now takes an `ImageReplace` or `ImageGuide` `binding` instead of a `frame_idx`. Replace existing `ImageConditioningInput(path, frame_idx, strength, crf)` calls with `ImageConditioningInput.at(path, frame_idx, strength, crf)` to preserve the previous frame-0 replacement and later-frame guidance behavior; use `.replace(path, frame_idx, strength, crf)` or `.guide(path, frame_idx, strength, crf)` to select a binding explicitly. Both bindings use pixel-frame indices.
+- `image_conditionings()` and `image_conditionings_for_chunk()` take `LoadedImageConditioning`s (from `ImageConditioner.load_conditionings`) instead of `ImageConditioningInput`s, and no longer take `color_space`.
+- Performance improvements, in collaboration with doubleAI (https://doubleai.com): faster transformer passes (especially under multi-GPU sequence parallelism and with perturbation guidance) and LoRA switches, denoising samplers without per-step CPU synchronization, a DFR spatial epilogue (`--spatial-upscalings 2`) on fewer tiles (at most 1024 px per side, overlapping by 64 px, instead of a 2x2 first step and 4x4 at a 320 px overlap) that multiplies its long video projections in fp8 on GPUs with fp8 GEMMs (compute capability 8.9+), carry keyframes rebuilt on the rank that decodes them, a multi-GPU video decode that streams to MP4 encoding as it decodes, faster diffusion VAE decoding with lower reserved GPU memory, a faster-compiling `--diffvae-optimization blackwell_dsl` kernel, lower GPU memory during MP4 encoding, faster image conditioning, and faster stage starts with a warm model registry. Output is not bit-identical to previous releases, mainly because of the DFR spatial epilogue's new tiles and fp8 GEMMs; diffusion VAE decodes also differ by rounding, and under multi-GPU sequence parallelism audio cross-attention no longer attends to the video sequence's padding tokens.
+
+### Removed
+
+- `ImageConditioningInput.frame_idx`, `.assert_in_clip()`, `.map_frame_index()` and `.to_item()`; use the same members on the `LoadedImageConditioning` returned by `ImageConditioner.load_conditionings`, or `input.binding.frame_idx`.
+- `KeyframeInterpolationPipeline` and the `ltx_pipelines.keyframe_interpolation` CLI; use `TI2VidTwoStagesPipeline` with `ImageConditioningInput.guide()` and `refine_audio=True`, or pass `--image … guide` with `--refine-audio`.
+
+### Fixed
+
+- DiffVAE 1-tile decode no longer produces gray frame tails from frame 128 on long 1080p clips under torch < 2.13. CUDA RMSNorm wrapped flattened offsets at 2^32 elements; last-dim norms are now T-chunked.
+- Compiling a transformer that uses blockwise FP8/FP6 quantization with `seq_dim_dynamic` no longer pins the sequence length. Previously each new length recompiled the blocks, and a batch size divisible by 4 failed with a `ConstraintViolationError`.
+- A warm multi-GPU DFR job (a second or later request in one process) could fail with "Cannot fit a DiffVAE decode tile". Cold and warm runs and every rank now plan the same decode tiles, and ranks with unequal GPUs no longer hang. `--diffvae-optimization blackwell_dsl` keyframe decodes plan smaller tiles.
+- Diffusion VAE decode with `--diffvae-optimization blackwell_dsl` could hang indefinitely on datacenter Blackwell: the fused stage-5 attention kernel re-armed its per-tile barriers while some warps were still waiting on them.
+
 ## 1.4.2 - 2026-10-01
 
 ### Added
@@ -31,13 +62,21 @@
 - `--exr-colorspace` on `ltx_pipelines.hdr_ic_lora` (`acescg` / `acescct` / `srgb_linear`; default `acescg`). Only the EXR sidecar encoding changes; the HLG master stays BT.2020/HLG.
 - `--transformer-path` on `ltx_pipelines.hdr_ic_lora`, which runs the pipeline from a split checkpoint pack instead of a distilled monolith. A split transformer carries no VAE weights, so `--video-vae-path` has to accompany it.
 - `EXRColorSpace` / `VideoInput` in `ltx_pipelines` and an sRGB EOTF in `ltx_core.hdr`, which convert an SDR source into ACEScct.
+- `TokenTimesteps` in `ltx_core`, which holds either dense per-token timesteps or a compact distinct-value table plus per-token indices. `TokenTimesteps.per_token()` expands either representation.
+- `DenoiseMask` in `ltx_core.types`, which holds a per-token denoise mask and the table of its distinct values. Build the mask on the host; `DenoiseMask.compact(device)` tabulates its values and moves mask and table to the device before denoising.
+
+### Fixed
+
+- `FlashAttention4` accepts current `flash-attn-4` releases that return the output tensor directly while remaining compatible with older tuple-returning releases.
 
 ### Changed
 
 - The `ltx_kernels_inductor` compile backend batches the fp8-cast policy's per-forward weight and bias upcasts into a few grouped kernels instead of one per tensor. Outputs are bit-identical.
+- The `ltx_kernels_inductor` and `ltx_kernels_eager` compile backends run unmasked attention on whichever of cuDNN and flash attention is faster for each shape, which moves short-query attention (audio queries over video keys) off cuDNN's non-split fallback. The first call per attention shape times both kernels, so warmup takes slightly longer. This also applies when an `SDPA_*` attention backend is pinned.
 - Chunk planning owns generated-keyframe placement and appends slots after pipeline conditionings. Generated slots remain transformer conditioning across every stage; `decode_with_keyframes` now controls only whether the final slots anchor video decode.
 - `ChunkConfig.overlap_blend_frames` defaults to the full carry overlap (crossfade over all carried frames). Pass `0` for a hard cut at chunk seams.
 - `ChunkConfig.overlap_blend_frames` linearly crossfades a configurable suffix of each decoded overlap instead of cutting directly between windows, buffering only that suffix during streaming.
+- Under sequence parallelism, the `ltx_kernels_inductor` compile backend has the q/k RMS-norm + RoPE kernel and the v projection write each head straight into the all2all exchange buffer of the rank that owns it, instead of producing a local tensor for a separate exchange kernel. Outputs are bit-identical.
 - DFR spatial epilogues run their first denoising step on a 2x2 tile grid before retiling any remaining steps to 4x4. A one-step schedule stays on the 2x2 grid.
 - `create_initial_audio_latent` now takes a video latent and required `video_scale_factors`. Joint first stages use `create_initial_av_latents`, which also requires `video_scale_factors`. `create_initial_video_latent` requires `scale_factors` (no default). Pass the same video VAE factors used to size the video latent. Audio-only callers use `AudioLatentShape.from_duration`.
 - Distilled and DFR sample with Euler ancestral (`eta=1.0`, `s_noise=1.0`) on LTX-2.5+ checkpoints -- distilled on both stages, DFR on stage 1, stage 2 and the spatial epilogue -- so generated output for those checkpoints differs from the previous release. Older generations sample with deterministic Euler. DFR's temporal densify tiles are unchanged at `eta=0.5`.
@@ -52,6 +91,9 @@
 - `--distilled-checkpoint-path` on `ltx_pipelines.hdr_ic_lora` is no longer required, since `--transformer-path` can supply the transformer instead. One of the two is still needed.
 - DFR seam keyframes on `ltx_pipelines.hdr_ic_lora` are on by default. `--with-keyframes` is replaced by `--no-keyframes`. A 2.4 transformer fails the capability check unless `--no-keyframes` is passed; a 2.5 distilled monolith still needs `--video-vae-path` to a keyframe-trained VAE or the keyframe path is a silent no-op.
 - `ltx-core` requires `colour-science`, which supplies the primaries, YUV matrix and HLG transfer definitions that were previously hand-written constants.
+- The transformer projects AdaLN modulation once per distinct timestep value and reads it per token through `Modality.timesteps.indices` when a pipeline supplies a compact timestep table. Outputs are not bit-identical to previous releases. The saving is proportional to the token count while attention grows with its square, so its share of the forward shrinks as resolution rises: about 2-3% on one GPU at 16k tokens (544x960x241), and less per rank under sequence parallelism.
+- `Modality.timesteps` takes a `TokenTimesteps` instead of a tensor; wrap per-token timesteps as `TokenTimesteps(timesteps)`.
+- `LatentState.denoise_mask` takes a `DenoiseMask` instead of a tensor; wrap the mask as `DenoiseMask(mask)` with `mask` on the host, and call `compact(device)` on it before a denoising loop reads the state.
 
 ### Removed
 

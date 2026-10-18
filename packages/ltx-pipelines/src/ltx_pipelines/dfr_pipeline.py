@@ -22,7 +22,8 @@ from ltx_core.model.video_vae import (
     get_video_chunks_number,
 )
 from ltx_core.model.video_vae.transformer import DiffVAEMode
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization import QuantizationPolicy, fp8_cast_fuse_rule
+from ltx_core.quantization.fp8_cast import supports_fp8_gemm, with_rowwise_fp8_gemm
 from ltx_core.types import VIDEO_SCALE_FACTORS, VideoPixelShape
 from ltx_pipelines.dfr_helpers.layout import resolve_canvas
 from ltx_pipelines.dfr_helpers.ops import (
@@ -47,6 +48,7 @@ from ltx_pipelines.iclora_utils import read_lora_reference_downscale_factor
 from ltx_pipelines.utils.args import (
     LoraAction,
     default_2_stage_distilled_arg_parser,
+    markers_from_args,
     resolve_cli_params,
     resolve_existing_path,
 )
@@ -241,6 +243,19 @@ class DFRPipeline:
             fps=fps,
         )
 
+    def _epilogue_stage(self) -> DiffusionStage:
+        """The detailing stage the spatial epilogue denoises with.
+        On an fp8-cast policy and a device with fp8 GEMMs, its long video projections multiply
+        e4m3 activations (:func:`~ltx_core.quantization.fp8_cast.with_rowwise_fp8_gemm`): the
+        epilogue is the last pass, where the precision costs least. Derived per call so it
+        follows whatever builder the stage carries (e.g. a multi-GPU runner's).
+        """
+        stage = self.stage_detailing
+        policy = stage.quantization
+        if policy is None or policy.fuse_rule is not fp8_cast_fuse_rule or not supports_fp8_gemm(self.device):
+            return stage
+        return stage.with_quantization(with_rowwise_fp8_gemm(policy))
+
     def __call__(  # noqa: PLR0913, PLR0915
         self,
         prompt: str,
@@ -267,7 +282,8 @@ class DFRPipeline:
             raise ValueError(f"spatial_upscalings must be 1 or 2, got {spatial_upscalings}")
 
         require_num_frames_source(num_frames, self.duration_predictor)
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images)
         assert_resolution(
             height=height,
             width=width,
@@ -284,7 +300,7 @@ class DFRPipeline:
             [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -355,47 +371,49 @@ class DFRPipeline:
         )
 
         last_window_seams: list[int] = []
-        for round_idx in range(1, temporal_upscalings + 1):
-            assert self.temporal_upsampler is not None
-            if not keyframes:
-                raise RuntimeError(f"Temporal round {round_idx}: missing carry-forward keyframes")
-            video_shape = video_shape._replace(frames=2 * (video_shape.frames - 1) + 1, fps=2 * video_shape.fps)
-            video_state, keyframes, last_window_seams = run_one_temporal_round(
-                round_idx=round_idx,
-                stage=self.stage,
-                temporal_upsampler=self.temporal_upsampler,
-                image_conditioner=self.image_conditioner,
-                video_state=video_state,
-                keyframes=keyframes,
-                video_shape=video_shape,
-                images=images,
-                video_context=video_context,
-                audio_context=audio_context,
-                audio_latent=audio_latent,
-                source_duration=source_duration,
-                seed=seed,
-                noiser=noiser,
-                sigmas=DISTILLED_SIGMAS[4:].to(dtype=torch.float32, device=self.device),
-                device=self.device,
-                dtype=dtype,
-                temporal_scale=temporal_scale,
-            )
-            self._emit_stage(
-                f"t{round_idx}",
-                latent=video_state.latent,
-                keyframes=keyframes,
-                height=video_shape.height,
-                width=video_shape.width,
-                num_frames=video_shape.frames,
-                fps=video_shape.fps,
-            )
+        # One transformer for every temporal tile of every round instead of a build per tile.
+        with self.stage.resident():
+            for round_idx in range(1, temporal_upscalings + 1):
+                assert self.temporal_upsampler is not None
+                if not keyframes:
+                    raise RuntimeError(f"Temporal round {round_idx}: missing carry-forward keyframes")
+                video_shape = video_shape._replace(frames=2 * (video_shape.frames - 1) + 1, fps=2 * video_shape.fps)
+                video_state, keyframes, last_window_seams = run_one_temporal_round(
+                    round_idx=round_idx,
+                    stage=self.stage,
+                    temporal_upsampler=self.temporal_upsampler,
+                    image_conditioner=self.image_conditioner,
+                    video_state=video_state,
+                    keyframes=keyframes,
+                    video_shape=video_shape,
+                    images=images,
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    audio_latent=audio_latent,
+                    source_duration=source_duration,
+                    seed=seed,
+                    noiser=noiser,
+                    sigmas=DISTILLED_SIGMAS[4:].to(dtype=torch.float32),
+                    device=self.device,
+                    dtype=dtype,
+                    temporal_scale=temporal_scale,
+                )
+                self._emit_stage(
+                    f"t{round_idx}",
+                    latent=video_state.latent,
+                    keyframes=keyframes,
+                    height=video_shape.height,
+                    width=video_shape.width,
+                    num_frames=video_shape.frames,
+                    fps=video_shape.fps,
+                )
         num_frames = video_shape.frames
         current_fps = video_shape.fps
 
         # --- Spatial epilogue (spatial_upscalings == 2): s2 is h/2; this pass is final H x W ---
         if spatial_upscalings == 2:
             epi = run_spatial_epilogue(
-                stage=self.stage_detailing,
+                stage=self._epilogue_stage(),
                 upsampler=self.upsampler,
                 image_conditioner=self.image_conditioner,
                 video_decoder=self.video_decoder,
@@ -498,6 +516,7 @@ def main() -> None:
     params = resolve_cli_params(distilled=True)
     parser = add_dfr_cli_args(default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True))
     args = parser.parse_args()
+    video_marker, audio_marker = markers_from_args(args, device=get_device())
 
     pipeline = DFRPipeline(
         model_paths=args.model_paths,
@@ -532,6 +551,8 @@ def main() -> None:
         audio=result.audio,
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

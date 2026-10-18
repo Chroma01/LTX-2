@@ -42,6 +42,7 @@ from ltx_pipelines.utils.args import (
     add_keyframe_decode_arg,
     chunk_config_from_args,
     default_2_stage_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -75,7 +76,13 @@ from ltx_pipelines.utils.media_io import (
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ImageConditioningInput, OffloadMode, PipelineOutput, VideoAudio
+from ltx_pipelines.utils.types import (
+    ImageConditioningInput,
+    LoadedImageConditioning,
+    OffloadMode,
+    PipelineOutput,
+    VideoAudio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +97,7 @@ class _A2VidRunContext:
     noiser: GaussianNoiser
     dtype: torch.dtype
     vae_dtype: torch.dtype
-    images: list[ImageConditioningInput]
+    images: list[LoadedImageConditioning]
     v_context_p: torch.Tensor
     a_context_p: torch.Tensor
     v_context_n: torch.Tensor
@@ -207,6 +214,7 @@ class A2VidPipelineTwoStage:
         num_frames: int | None,
         frame_rate: float,
         images: list[ImageConditioningInput],
+        color_space: EXRColorSpace | None,
         audio_path: str,
         audio_start_time: float,
         audio_max_duration: float | None,
@@ -219,7 +227,8 @@ class A2VidPipelineTwoStage:
         chunk_config: ChunkConfig | None = None,
     ) -> _A2VidRunContext:
         """Validate inputs, decode/encode audio, and resolve frame count / tiling before chunk planning."""
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=True)
         assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage_1)
 
@@ -250,7 +259,7 @@ class A2VidPipelineTwoStage:
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -300,9 +309,8 @@ class A2VidPipelineTwoStage:
 
     def _video_conditionings(
         self,
-        images: list[ImageConditioningInput],
+        images: list[LoadedImageConditioning],
         num_frames: int,
-        color_space: EXRColorSpace | None,
     ) -> MakeVideoConditionings:
         assert_image_frames_in_clip(images, num_frames)
 
@@ -314,7 +322,6 @@ class A2VidPipelineTwoStage:
                     chunk,
                     images=images,
                     video_encoder=enc,
-                    color_space=color_space,
                 )
             )
 
@@ -415,6 +422,7 @@ class A2VidPipelineTwoStage:
             num_frames=num_frames,
             frame_rate=frame_rate,
             images=images,
+            color_space=color_space,
             audio_path=audio_path,
             audio_start_time=audio_start_time,
             audio_max_duration=audio_max_duration,
@@ -459,7 +467,7 @@ class A2VidPipelineTwoStage:
             config=ctx.chunk_config,
             video_scale_factors=self.stage_1.video_scale_factors,
             audio_latent=ctx.encoded_audio_latent,
-            make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames, color_space),
+            make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames),
             generated_keyframes=generated_keyframes,
         )
         base = denoise_chunks(
@@ -590,6 +598,8 @@ def main() -> None:
     params = resolve_cli_params()
     parser = add_chunk_layout_args(add_keyframe_decode_arg(add_generated_keyframes_arg(build_a2vid_arg_parser(params))))
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
+    video_marker, _ = markers_from_args(args, device=get_device(), color_space=hdr)
     num_frames, audio_max_duration = resolve_a2vid_duration_or_exit(parser, args, default_num_frames=params.num_frames)
     pipeline = A2VidPipelineTwoStage(
         model_paths=args.model_paths,
@@ -602,7 +612,6 @@ def main() -> None:
         prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         diffvae_optimization=args.diffvae_optimization,
     )
-    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     chunk_config = chunk_config_from_args(args)
     video_guider_params = MultiModalGuiderParams(
@@ -656,6 +665,7 @@ def main() -> None:
         video_chunks_number=video_chunks_number,
         color_space=hdr,
         audio_sampling_rate=audio_sampling_rate,
+        video_marker=video_marker,
     )
 
 

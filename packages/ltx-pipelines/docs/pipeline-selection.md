@@ -19,7 +19,7 @@ Do you need to condition on existing images/videos?
 ├─ YES → Do you have reference videos for video-to-video?
 │  ├─ YES → Use ICLoraPipeline
 │  └─ NO → Do you have multiple keyframe images to interpolate?
-│     ├─ YES → Use KeyframeInterpolationPipeline
+│     ├─ YES → Use TI2VidTwoStagesPipeline with `--image … guide` bindings
 │     └─ NO → Image-to-video (one still)
 │        ├─ Production quality / higher fps → DFRPipeline
 │        └─ Guided CFG/STG two-stage → TI2VidTwoStagesPipeline
@@ -43,11 +43,10 @@ Do you need to condition on existing images/videos?
 | -------- | ------ | --- | ---------- | ------------- | -------- |
 | [**DistilledPipeline**](pipelines.md#4-distilledpipeline) | 2 | ❌ | ✅ | Image | Fastest inference (starting point) |
 | [**DFRPipeline**](pipelines.md#12-dfrpipeline) | 2 (+ optional temporal rounds) | ❌ | ✅ spatial + optional temporal 2x | Image + [generated keyframes](conditioning.md#generated-keyframe-slots) | **Production quality**; higher effective frame rate |
-| [**TI2VidTwoStagesPipeline**](pipelines.md#1-ti2vidtwostagespipeline) | 2 | ✅ | ✅ | Image | Guided two-stage with CFG/STG |
+| [**TI2VidTwoStagesPipeline**](pipelines.md#1-ti2vidtwostagespipeline) | 2 | ✅ | ✅ | Image + keyframes | Guided two-stage with CFG/STG; animation and interpolation |
 | [**TI2VidTwoStagesHQPipeline**](pipelines.md#2-ti2vidtwostageshqpipeline) | 2 | ✅ | ✅ | Image | Same guided flow, res_2s sampler |
 | [**TI2VidOneStagePipeline**](pipelines.md#3-ti2vidonestagepipeline) | 1 | ✅ | ❌ | Image | Educational, prototyping |
 | [**ICLoraPipeline**](pipelines.md#5-iclorapipeline) | 2 | ✅ | ✅ | Image + Video | Video-to-video transformations |
-| [**KeyframeInterpolationPipeline**](pipelines.md#6-keyframeinterpolationpipeline) | 2 | ✅ | ✅ | Keyframes | Animation, interpolation |
 | [**A2VidPipelineTwoStage**](pipelines.md#7-a2vidpipelinetwostage) | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | [**RetakePipeline**](pipelines.md#8-retakepipeline) | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
 | [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 1 | ❌ | ❌ | Video | SDR-to-HDR with an HDR IC-LoRA (HLG master + EXR via `--exr-colorspace`); see also native [`--hdr`](hdr.md) |

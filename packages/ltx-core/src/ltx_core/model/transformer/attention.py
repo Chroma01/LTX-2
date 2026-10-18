@@ -166,6 +166,13 @@ class FlashAttention3(AttentionCallable):
         return out
 
 
+def _flash_attention_4_output(result: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Normalize FA4 return value: tensor (current releases) or legacy (out, aux) tuple."""
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
 class FlashAttention4(AttentionCallable):
     label = "FlashAttention4"
 
@@ -186,7 +193,8 @@ class FlashAttention4(AttentionCallable):
 
         q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
 
-        out, _ = flash_attn_4_func(q.to(v.dtype), k.to(v.dtype), v)
+        result = flash_attn_4_func(q.to(v.dtype), k.to(v.dtype), v)
+        out = _flash_attention_4_output(result)
         out = out.reshape(b, -1, heads * dim_head)
         return out
 
@@ -360,8 +368,12 @@ class AttentionFunction(Enum):
         Every non-AUTOMATIC variant raises :class:`RuntimeError` when the backend
         isn't usable on this machine -- missing package or SDPA backend rejected
         on this hardware (e.g. cuDNN under ``torch.use_deterministic_algorithms``).
-        Opting in means "this kernel or fail loudly". ``AUTOMATIC`` returns the
-        cached :func:`automatic_attention` instance so every build shares one callable.
+        Opting in means "this kernel or fail loudly", with one exception: under the
+        ``ltx_kernels_inductor`` and ``ltx_kernels_eager`` compile backends, an unmasked
+        call from ``PYTORCH`` or an ``SDPA_*`` variant runs ``ltx_kernels::sdpa_select``,
+        which picks cuDNN or flash attention per shape regardless of the pinned backend.
+        ``AUTOMATIC`` returns the cached :func:`automatic_attention` instance so every
+        build shares one callable.
         """
         match self:
             case AttentionFunction.AUTOMATIC:

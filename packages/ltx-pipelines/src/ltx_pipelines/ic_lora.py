@@ -47,6 +47,7 @@ from ltx_pipelines.utils.args import (
     add_keyframe_decode_arg,
     chunk_config_from_args,
     default_2_stage_distilled_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -89,6 +90,7 @@ from ltx_pipelines.utils.tiled_diffusion import (
 )
 from ltx_pipelines.utils.types import (
     ImageConditioningInput,
+    LoadedImageConditioning,
     OffloadMode,
     PipelineOutput,
     VideoAudio,
@@ -265,7 +267,7 @@ class _ICLoraRunContext:
     noiser: GaussianNoiser
     dtype: torch.dtype
     vae_dtype: torch.dtype
-    images: list[ImageConditioningInput]
+    images: list[LoadedImageConditioning]
     video_context: torch.Tensor
     audio_context: torch.Tensor
     num_frames: int
@@ -442,7 +444,8 @@ class ICLoraPipeline:
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
     ) -> _ICLoraRunContext:
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_generated_keyframes_request(
             decode_with_keyframes,
             generated_keyframes,
@@ -478,7 +481,7 @@ class ICLoraPipeline:
             [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -540,7 +543,6 @@ class ICLoraPipeline:
                         chunk,
                         images=ctx.images,
                         video_encoder=enc,
-                        color_space=ctx.color_space,
                     ),
                     *reference_video_conditionings_for_chunk(
                         chunk,
@@ -887,6 +889,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(
+        images=args.images,
+        video_paths=[path for path, _ in args.video_conditioning],
+        hdr=args.hdr,
+    )
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
 
     # Load mask video if provided via --conditioning-attention-mask
     conditioning_attention_mask = None
@@ -920,11 +928,6 @@ def main() -> None:
                 stage_2_ic_lora=args.stage_2_ic_lora,
                 skip_stage_2=args.skip_stage_2,
             ),
-        )
-        hdr = resolve_hdr_color_space(
-            images=args.images,
-            video_paths=[path for path, _ in args.video_conditioning],
-            hdr=args.hdr,
         )
         vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
         chunk_config = chunk_config_from_args(args)
@@ -968,6 +971,8 @@ def main() -> None:
             video_chunks_number=video_chunks_number,
             color_space=hdr,
             audio_sampling_rate=audio_sampling_rate,
+            video_marker=video_marker,
+            audio_marker=audio_marker,
         )
     except _IC_LORA_OOM as exc:
         reraise_ic_lora_oom(exc, tile=args.tile)

@@ -89,6 +89,14 @@ void allgather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, in
                       int seqlen, int hidden_dim, int total_tokens, cudaStream_t stream, int num_sms,
                       at::ScalarType tensor_dtype, uint64_t timeout_cycles);
 
+void rope_scatter_heads_launch(void *x, void *sin_freqs, void *cos_freqs, void *weights, float eps, int b, int s, int n,
+                               int h, long cos_sb, long cos_sn, long cos_ss, long sin_sb, long sin_sn, long sin_ss,
+                               void **buffer_ptrs, int **barrier_signal_ptrs, int rank, int world_size,
+                               uint64_t timeout_cycles, bool barrier, cudaStream_t stream);
+
+void fused_barrier_launch(int **barrier_signal_ptrs, int rank, int world_size, uint64_t timeout_cycles,
+                          cudaStream_t stream);
+
 } // namespace all2all_cuda
 } // namespace all2all
 } // namespace ltx_kernels

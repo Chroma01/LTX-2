@@ -72,6 +72,16 @@ def allow_async_transfer(device: torch.device) -> bool:
     return device.type == "cuda"
 
 
+def upload_from_host(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy a host tensor to *device*, without blocking the host where the backend allows it.
+    The transfer reads a pinned copy, so ``host`` may be modified as soon as this returns. A tensor
+    that is not on the host is moved with ``.to``.
+    """
+    if not allow_async_transfer(device) or host.device.type != "cpu":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
+
+
 def synchronize_device(device: DeviceSpec = None) -> None:
     """Synchronize CUDA or MPS work if the selected backend supports it."""
     resolved = resolve_device(device)
@@ -108,6 +118,27 @@ def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
     reserved = torch.cuda.memory_reserved(idx)
     under_fraction = max(0, int(fraction * props_total) - int(reserved))
     return min(int(free_raw), under_fraction)
+
+
+def cuda_allocatable_bytes(device: DeviceSpec = None) -> int:
+    """Bytes a new CUDA allocation in this process can still get, counting the allocator's cache.
+    Like :func:`cuda_activation_budget_bytes`, but reserved blocks that hold no tensor count as
+    available: the caching allocator serves new allocations from them and releases them to the
+    driver before an allocation fails. ``fraction * device_total - memory_allocated``, capped by
+    raw free memory plus those cached blocks.
+    """
+    if not torch.cuda.is_available():
+        return 0
+    resolved = resolve_device(device)
+    if resolved.type != "cuda":
+        return 0
+    idx = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    free_raw, _total_raw = torch.cuda.mem_get_info(idx)
+    props_total = torch.cuda.get_device_properties(idx).total_memory
+    fraction = torch.cuda.get_per_process_memory_fraction(idx)
+    allocated = int(torch.cuda.memory_allocated(idx))
+    cached = max(0, int(torch.cuda.memory_reserved(idx)) - allocated)
+    return max(0, min(int(free_raw) + cached, int(fraction * props_total) - allocated))
 
 
 def mps_activation_budget_bytes(device: DeviceSpec = None) -> int:

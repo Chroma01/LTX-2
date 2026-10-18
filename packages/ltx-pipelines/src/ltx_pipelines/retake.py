@@ -19,7 +19,10 @@ from ltx_core.types import (
     SpatioTemporalScaleFactors,
     VideoPixelShape,
 )
-from ltx_pipelines.utils.args import video_editing_arg_parser
+from ltx_pipelines.utils.args import (
+    markers_from_args,
+    video_editing_arg_parser,
+)
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
     AudioDecoder,
@@ -340,6 +343,8 @@ def main() -> None:
     parser = video_editing_arg_parser(distilled=True)
     parser.description = "Retake: regenerate a time region of a video with LTX-2."
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
 
     if args.start_time >= args.end_time:
         raise ValueError("start_time must be less than end_time")
@@ -367,7 +372,6 @@ def main() -> None:
         diffvae_optimization=args.diffvae_optimization,
     )
     params = detect_params(args.model_paths.transformer())
-    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     result = pipeline(
         video_path=args.video_path,
@@ -393,6 +397,8 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

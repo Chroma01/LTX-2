@@ -24,11 +24,13 @@ def _get_tma_aligned_size(n: int, element_size: int) -> int:
     return ((n + num_elems_tma - 1) // num_elems_tma) * num_elems_tma
 
 
-def _empty_tma_aligned_scales(num_rows: int, num_blocks: int, device: torch.device) -> tuple[torch.Tensor, int]:
-    """Allocate MN-major FP32 scales with TMA-padded row storage."""
-    tma_aligned_mn = _get_tma_aligned_size(num_rows, 4)
-    scales = torch.empty((num_blocks, tma_aligned_mn), dtype=torch.float, device=device).t()[:num_rows]
-    return scales, tma_aligned_mn
+def _empty_tma_aligned_scales(num_rows: int, num_blocks: int, device: torch.device) -> torch.Tensor:
+    """Allocate ``(num_blocks, tma_aligned_rows)`` FP32 scale storage.
+    Kernels write this tensor itself; the op returns ``.t()[:num_rows]``, the MN-major
+    ``(num_rows, num_blocks)`` view. Writing through that view instead makes inductor guard
+    on whether ``num_rows`` is TMA-aligned, so a dynamic row count recompiles per alignment.
+    """
+    return torch.empty((num_blocks, _get_tma_aligned_size(num_rows, 4)), dtype=torch.float, device=device)
 
 
 @jit

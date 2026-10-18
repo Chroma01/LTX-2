@@ -37,10 +37,10 @@ from ltx_pipelines.utils.blocks import (
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
-    combined_image_conditionings,
     create_initial_video_latent,
     ensure_tiling_config,
     get_device,
+    image_conditionings,
     tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
@@ -49,6 +49,7 @@ from ltx_pipelines.utils.types import (
     DEFAULT_AUTO_DURATION,
     AutoDuration,
     ImageConditioningInput,
+    LoadedImageConditioning,
     ModalitySpec,
     OffloadMode,
     PipelineOutput,
@@ -128,7 +129,7 @@ class AlphaGenPipeline:
         if not video_conditioning:
             raise ValueError("Alpha-gen requires at least one reference video")
         require_num_frames_source(num_frames, self.duration_predictor)
-        images = self.image_conditioner.resolve_crf(images)
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=False)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -189,21 +190,20 @@ class AlphaGenPipeline:
     def _conditionings(
         self,
         video_encoder: VideoEncoder,
-        images: list[ImageConditioningInput],
+        images: list[LoadedImageConditioning],
         video_conditioning: list[tuple[str, float]],
         height: int,
         width: int,
         num_frames: int,
         color_space: EXRColorSpace | None,
     ) -> list[ConditioningItem]:
-        conditionings = combined_image_conditionings(
+        conditionings = image_conditionings(
             images=images,
             height=height,
             width=width,
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
-            color_space=color_space,
         )
         append_ic_lora_reference_video_conditionings(
             conditionings,
